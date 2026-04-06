@@ -16,5 +16,4 @@ func TestOsStore(t *testing.T) {
 			return stores.Use("test")
 		})
 	})
-
 }

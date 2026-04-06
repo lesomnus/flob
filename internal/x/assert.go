@@ -16,13 +16,13 @@ func New(t *testing.T) X {
 	return X{t: t}
 }
 
-func (a X) Eq(got, want any) {
+func (a X) Eq(expected, actual any) {
 	a.t.Helper()
-	if reflect.DeepEqual(got, want) {
+	if reflect.DeepEqual(expected, actual) {
 		return
 	}
 
-	a.t.Fatalf("assert.Eq failed: got=%s want=%s", formatValue(got), formatValue(want))
+	a.t.Fatalf("assert.Eq failed: got=%s want=%s", formatValue(actual), formatValue(expected))
 }
 
 func (a X) NotError(err error) {

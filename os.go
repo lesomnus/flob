@@ -11,7 +11,7 @@ package flat
 // │  └─ xx/
 // │     └─ xx/
 // │        └─ xxxx...
-// └─ index/
+// └─ repos/
 //    └─ (id)/
 //       └─ xx/
 //          └─ xx/
@@ -52,7 +52,7 @@ func (i OsStores) Root() string {
 func (i OsStores) Use(id string) Store {
 	return OsStore{
 		root: i.root,
-		repo: filepath.Join(i.root, "index", id),
+		repo: filepath.Join(i.root, "repos", id),
 		lock: i.lock,
 	}
 }
@@ -130,16 +130,24 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	}
 
 	// We are the only one adding the blob with the given digest, so stage the blob.
-	ps := filepath.Join(s.root, "stage")
-	if err := os.MkdirAll(ps, 0o755); err != nil {
-		return m, fmt.Errorf("mkdir stage: %w", err)
+	ps, err := s.ensureStagePath()
+	if err != nil {
+		return m, fmt.Errorf("ensure stage path: %w", err)
 	}
 
 	ps, err = os.MkdirTemp(ps, "")
 	if err != nil {
 		return m, fmt.Errorf("mkdir temp at stage: %w", err)
 	}
-	defer os.RemoveAll(ps)
+
+	ok := false
+	defer func() {
+		if ok {
+			// The file is moved to the repo.
+			return
+		}
+		os.RemoveAll(ps)
+	}()
 
 	// Write labels first.
 	lf, err := os.Create(filepath.Join(ps, "labels"))
@@ -194,6 +202,7 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 		return m, fmt.Errorf("move from stage to repo: %w", err)
 	}
 
+	ok = true
 	return m, nil
 }
 
@@ -221,6 +230,53 @@ func (s OsStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, e
 }
 
 func (s OsStore) Label(ctx context.Context, d Digest, labels Labels) error {
+	// Check if the blob exists first to avoid unnecessary work.
+	p := s.pathToRepo(d)
+	if _, err := os.Stat(p); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrNotExist
+		}
+		return fmt.Errorf("stat: %w", err)
+	}
+
+	// We don't need to acquire the lock here since rename is atomic.
+
+	ps, err := s.ensureStagePath()
+	if err != nil {
+		return fmt.Errorf("ensure stage path: %w", err)
+	}
+
+	f, err := os.CreateTemp(ps, "")
+	if err != nil {
+		return fmt.Errorf("create temp at stage: %w", err)
+	}
+
+	ok := false
+	defer func(p string) {
+		if ok {
+			// The file is moved to the repo.
+			return
+		}
+		os.Remove(p)
+	}(f.Name())
+
+	defer f.Close()
+
+	if err := writeLabels(f, labels); err != nil {
+		return fmt.Errorf("write labels: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close labels: %w", err)
+	}
+
+	pl := s.pathToRepo(d, "labels")
+	if err := os.Rename(f.Name(), pl); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrNotExist
+		}
+		return fmt.Errorf("move labels to repo: %w", err)
+	}
+
 	return nil
 }
 
@@ -341,6 +397,15 @@ func (s OsStore) pathToRepo(d Digest, elem ...string) string {
 	parts = append(parts, s.repo, v[0:2], v[2:4], v[4:])
 	parts = append(parts, elem...)
 	return filepath.Join(parts...)
+}
+
+func (s OsStore) ensureStagePath() (string, error) {
+	ps := filepath.Join(s.root, "stage")
+	if err := os.MkdirAll(ps, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir stage: %w", err)
+	}
+
+	return ps, nil
 }
 
 func (s OsStore) lockBlob(ctx context.Context, d Digest) (func(ctx context.Context) error, error) {
