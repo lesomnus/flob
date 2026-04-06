@@ -38,10 +38,11 @@ var (
 
 type OsStores struct {
 	root string
+	lock NamedLock
 }
 
 func NewOsStores(root string) OsStores {
-	return OsStores{root}
+	return OsStores{root, OsFileLocker{filepath.Join(root, "locks")}}
 }
 
 func (i OsStores) Root() string {
@@ -52,12 +53,14 @@ func (i OsStores) Use(id string) Store {
 	return OsStore{
 		root: i.root,
 		repo: filepath.Join(i.root, "index", id),
+		lock: i.lock,
 	}
 }
 
 type OsStore struct {
 	root string
 	repo string
+	lock NamedLock
 }
 
 func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
@@ -114,11 +117,11 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 
 	// We decided to add the blob, so acquire the lock to prevent concurrent Add
 	// or Erase with the same digest.
-	unlock, err := s.lock(ctx, d)
+	unlock, err := s.lockBlob(ctx, d)
 	if err != nil {
 		return m, err
 	}
-	defer unlock()
+	defer unlock(ctx)
 
 	// Maybe another process added the blob while we were waiting for the lock, so
 	// check again.
@@ -183,10 +186,11 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	}
 
 	// Now the blob is staged, so move it to the destination path atomically.
-	if err := os.MkdirAll(filepath.Dir(pb), 0o755); err != nil {
+	pr := filepath.Dir(pb)
+	if err := os.MkdirAll(pr, 0o755); err != nil {
 		return m, fmt.Errorf("mkdir repo: %w", err)
 	}
-	if err := os.Rename(ps, pb); err != nil {
+	if err := os.Rename(ps, pr); err != nil {
 		return m, fmt.Errorf("move from stage to repo: %w", err)
 	}
 
@@ -221,12 +225,62 @@ func (s OsStore) Label(ctx context.Context, d Digest, labels Labels) error {
 }
 
 func (s OsStore) Erase(ctx context.Context, d Digest) error {
-	p := s.pathToRepo(d)
-	if err := os.RemoveAll(p); err != nil && !os.IsNotExist(err) {
+	pr := s.pathToRepo(d)
+	if err := os.RemoveAll(pr); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
+	// Do not return error since the cleanup is best-effort and the blob
+	// for the tenant already removed so Erase itself is successful.
+	s.tryCleanup(ctx, d)
+
 	return nil
+}
+
+// Check if the blob was the last one, and if so, remove the global blob.
+func (s OsStore) tryCleanup(ctx context.Context, d Digest) (bool, error) {
+	pb := s.pathToBlob(d)
+	info, err := os.Stat(pb)
+	if err != nil {
+		return false, fmt.Errorf("stat blob: %w", err)
+	}
+
+	n, err := nlink(info.Sys())
+	if err != nil {
+		return false, fmt.Errorf("nlink: %w", err)
+	}
+	if n > 1 {
+		// There is another link to the blob.
+		return false, nil
+	}
+
+	unlock, err := s.lockBlob(ctx, d)
+	if err != nil {
+		return false, fmt.Errorf("lock blob: %w", err)
+	}
+	defer unlock(ctx)
+
+	// Check nlink again after acquiring the lock to make sure there is still only one link.
+	info, err = os.Stat(pb)
+	if err != nil {
+		return false, fmt.Errorf("stat blob: %w", err)
+	}
+
+	n, err = nlink(info.Sys())
+	if err != nil {
+		return false, fmt.Errorf("nlink: %w", err)
+	}
+	if n > 1 {
+		// There is another link to the blob.
+		return false, nil
+	}
+
+	// Do.
+	if err := os.Remove(pb); err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("remove blob: %w", err)
+	}
+
+	return true, nil
 }
 
 func (s OsStore) open(_ context.Context, d Digest) (pb string, m Meta, err error) {
@@ -289,20 +343,48 @@ func (s OsStore) pathToRepo(d Digest, elem ...string) string {
 	return filepath.Join(parts...)
 }
 
-func (s OsStore) lock(ctx context.Context, d Digest) (func() error, error) {
-	pl := filepath.Join(s.root, "locks", string(d))
-	if err := os.MkdirAll(filepath.Dir(pl), 0o755); err != nil {
+func (s OsStore) lockBlob(ctx context.Context, d Digest) (func(ctx context.Context) error, error) {
+	lock, err := s.lock.New(string(d))
+	if err != nil {
+		return nil, fmt.Errorf("create lock: %w", err)
+	}
+	if err := lock.Lock(ctx); err != nil {
+		return nil, fmt.Errorf("lock: %w", err)
+	}
+
+	return lock.Unlock, nil
+}
+
+var _ NamedLock = OsFileLocker{}
+
+type OsFileLocker struct {
+	root string // "/locks"
+}
+
+func (l OsFileLocker) New(name string) (Locker, error) {
+	p := filepath.Join(l.root, name)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir locks: %w", err)
 	}
 
-	fl := flock.New(pl)
-	for {
-		if ok, err := fl.TryLockContext(ctx, 100*time.Millisecond); err != nil {
-			return nil, err
-		} else if ok {
-			break
-		}
-	}
+	return OsFileLock{flock.New(p)}, nil
+}
 
-	return fl.Unlock, nil
+var _ Locker = OsFileLock{}
+
+type OsFileLock struct {
+	lock *flock.Flock
+}
+
+func (l OsFileLock) Lock(ctx context.Context) error {
+	_, err := l.lock.TryLockContext(ctx, 100*time.Millisecond)
+	return err
+}
+
+func (l OsFileLock) TryLock(ctx context.Context) (bool, error) {
+	return l.lock.TryLock()
+}
+
+func (l OsFileLock) Unlock(ctx context.Context) error {
+	return l.lock.Unlock()
 }
