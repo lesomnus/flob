@@ -296,12 +296,8 @@ func (s OsStore) Erase(ctx context.Context, d Digest) error {
 // Check if the blob was the last one, and if so, remove the global blob.
 func (s OsStore) tryCleanup(ctx context.Context, d Digest) (bool, error) {
 	pb := s.pathToBlob(d)
-	info, err := os.Stat(pb)
-	if err != nil {
-		return false, fmt.Errorf("stat blob: %w", err)
-	}
 
-	n, err := nlink(info.Sys())
+	n, err := nlink(pb)
 	if err != nil {
 		return false, fmt.Errorf("nlink: %w", err)
 	}
@@ -317,12 +313,7 @@ func (s OsStore) tryCleanup(ctx context.Context, d Digest) (bool, error) {
 	defer unlock(ctx)
 
 	// Check nlink again after acquiring the lock to make sure there is still only one link.
-	info, err = os.Stat(pb)
-	if err != nil {
-		return false, fmt.Errorf("stat blob: %w", err)
-	}
-
-	n, err = nlink(info.Sys())
+	n, err = nlink(pb)
 	if err != nil {
 		return false, fmt.Errorf("nlink: %w", err)
 	}

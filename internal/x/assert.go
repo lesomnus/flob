@@ -1,6 +1,7 @@
 package x
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -11,9 +12,9 @@ type X struct {
 	t *testing.T
 }
 
-func New(t *testing.T) X {
+func New(t *testing.T) (context.Context, X) {
 	t.Helper()
-	return X{t: t}
+	return t.Context(), X{t: t}
 }
 
 func (a X) Eq(expected, actual any) {
@@ -25,7 +26,7 @@ func (a X) Eq(expected, actual any) {
 	a.t.Fatalf("assert.Eq failed: got=%s want=%s", formatValue(actual), formatValue(expected))
 }
 
-func (a X) NotError(err error) {
+func (a X) NoError(err error) {
 	a.t.Helper()
 	if err == nil {
 		return
