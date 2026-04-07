@@ -1,10 +1,10 @@
-package flat
+package flob
 
 import (
 	"os"
 	"testing"
 
-	"github.com/lesomnus/flat/internal/x"
+	"github.com/lesomnus/flob/internal/x"
 )
 
 func TestOsStore(t *testing.T) {

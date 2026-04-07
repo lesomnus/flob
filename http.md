@@ -20,13 +20,13 @@ ETag: "<digest>"    SHA-256 digest of the blob (quoted per RFC 7232)
 Content-Length: N   Size of the blob in bytes
 ```
 
-Labels in requests (POST, PATCH) use a `Flat-` prefix to avoid collision with standard HTTP headers.
+Labels in requests (POST, PATCH) use a `Flob-` prefix to avoid collision with standard HTTP headers.
 In responses, labels are returned without the prefix as plain headers.
 
 For example, a blob labeled with `Foo: bar` is sent in a request as:
 
 ```
-Flat-Foo: bar
+Flob-Foo: bar
 ```
 
 And returned in a response as:
@@ -43,7 +43,7 @@ POST /{store-id}/{digest}
 ```
 
 Uploads a new blob. The request body is the blob content.
-Labels are specified as `Flat-<Key>` request headers.
+Labels are specified as `Flob-<Key>` request headers.
 If a blob with the same digest already exists, the server returns `409 Conflict`.
 
 When a digest is provided in the path, it is verified against the computed digest.
@@ -54,7 +54,7 @@ Example request:
 ```http
 POST /my-store HTTP/1.1
 Content-Type: application/octet-stream
-Flat-Foo: bar
+Flob-Foo: bar
 
 <blob content>
 ```
@@ -64,7 +64,7 @@ Example request with digest:
 ```http
 POST /my-store/3b4c... HTTP/1.1
 Content-Type: application/octet-stream
-Flat-Foo: bar
+Flob-Foo: bar
 
 <blob content>
 ```
@@ -125,7 +125,7 @@ PATCH /{store-id}/{digest}
 ```
 
 Replaces all labels of a blob. The new label set is taken entirely from the
-`Flat-<Key>` request headers — existing labels are discarded and replaced with the provided ones.
+`Flob-<Key>` request headers — existing labels are discarded and replaced with the provided ones.
 The request body must be empty.
 Returns `404 Not Found` if the blob does not exist.
 
@@ -133,7 +133,7 @@ Example request:
 
 ```http
 PATCH /my-store/3b4c... HTTP/1.1
-Flat-Foo: baz
+Flob-Foo: baz
 ```
 
 Success response (`204 No Content`).

@@ -1,11 +1,11 @@
-package flat
+package flob
 
 import (
 	"io"
 	"testing"
 	"time"
 
-	"github.com/lesomnus/flat/internal/x"
+	"github.com/lesomnus/flob/internal/x"
 )
 
 func TestCacheStore(t *testing.T) {

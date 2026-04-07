@@ -1,10 +1,10 @@
-package flat
+package flob
 
 import (
 	"io"
 	"testing"
 
-	"github.com/lesomnus/flat/internal/x"
+	"github.com/lesomnus/flob/internal/x"
 )
 
 var digest_nil = Digest("0000000000000000000000000000000000000000000000000000000000000000")

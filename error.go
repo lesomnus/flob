@@ -1,4 +1,4 @@
-package flat
+package flob
 
 import (
 	"errors"

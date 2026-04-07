@@ -1,4 +1,4 @@
-package flat
+package flob
 
 import (
 	"bytes"
@@ -21,7 +21,7 @@ import (
 //	PATCH  /{store-id}/{digest} - [Store.Label]
 //	DELETE /{store-id}/{digest} - [Store.Erase]
 //
-// Headers with the "Flat-" prefix are saved as labels and returned in the response
+// Headers with the "Flob-" prefix are saved as labels and returned in the response
 // of GET and HEAD requests without the prefix.
 type HttpHandler struct {
 	Stores Stores
@@ -147,11 +147,11 @@ func (h *HttpHandler) parsePath(path string) (storeID, digest string, ok bool) {
 	}
 }
 
-// parseLabels extracts headers with the "Flat-" prefix from r, strips the prefix,
+// parseLabels extracts headers with the "Flob-" prefix from r, strips the prefix,
 // and updates vs with the resulting key-value pairs.
 func (h *HttpHandler) parseLabels(vs Labels, r *http.Request) {
 	for key, values := range r.Header {
-		if after, ok := strings.CutPrefix(key, "Flat-"); ok {
+		if after, ok := strings.CutPrefix(key, "Flob-"); ok {
 			vs[after] = values
 		}
 	}
@@ -285,11 +285,11 @@ func (s HttpStore) Erase(ctx context.Context, d Digest) error {
 	return s.parseErr(resp)
 }
 
-// setLabels writes labels to req as Flat-<Key> headers.
+// setLabels writes labels to req as Flob-<Key> headers.
 func (HttpStore) setLabels(req *http.Request, labels Labels) {
 	for key, values := range labels {
 		for _, v := range values {
-			req.Header.Add("Flat-"+key, v)
+			req.Header.Add("Flob-"+key, v)
 		}
 	}
 }

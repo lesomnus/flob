@@ -1,6 +1,6 @@
 //go:build linux
 
-package flat
+package flob
 
 import (
 	"fmt"

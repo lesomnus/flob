@@ -1,4 +1,4 @@
-package flat
+package flob
 
 // /
 // ├─ stage/
@@ -82,7 +82,7 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 
 	// Write to a local temp file first, not to the store root since the store root
 	// may be on a different device and we need to compute the digest while writing.
-	tf, err := os.CreateTemp("", "flat-*")
+	tf, err := os.CreateTemp("", "flob-*")
 	if err != nil {
 		return m, fmt.Errorf("create temp: %w", err)
 	}

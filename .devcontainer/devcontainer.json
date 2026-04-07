@@ -1,5 +1,5 @@
 {
-	"name": "lesomnus.flat",
+	"name": "lesomnus.flob",
 	"build": {
 		"dockerfile": "Dockerfile"
 	},

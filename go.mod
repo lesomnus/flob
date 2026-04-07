@@ -1,4 +1,4 @@
-module github.com/lesomnus/flat
+module github.com/lesomnus/flob
 
 go 1.26.1
 
