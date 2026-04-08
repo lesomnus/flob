@@ -14,7 +14,7 @@ func TestHttpStore(t *testing.T) {
 			s := httptest.NewServer(h)
 			t.Cleanup(s.Close)
 
-			return HttpStores{Client: s.Client(), Base: s.URL}
+			return HttpStores{Client: s.Client(), Target: s.URL}
 		})
 	})
 }

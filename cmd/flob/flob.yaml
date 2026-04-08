@@ -1,0 +1,9 @@
+stores:
+  use: mem/test
+  mem/test:
+  os/cwd:
+    path: .flob
+  http/local:
+
+client:
+  use: http/local

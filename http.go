@@ -27,7 +27,7 @@ type HttpHandler struct {
 	Stores Stores
 }
 
-func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	id, digest_raw, ok := h.parsePath(r.URL.Path)
 	if !ok {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -172,7 +172,7 @@ func (h *HttpHandler) setMetaHeaders(w http.ResponseWriter, m Meta) {
 // HttpStores is an HTTP client for [HttpHandler] server.
 type HttpStores struct {
 	Client *http.Client
-	Base   string // base URL of the server, e.g. "http://localhost:8080"
+	Target string // base URL of the server, e.g. "http://localhost:8080"
 }
 
 func (s HttpStores) Use(id string) Store {
@@ -182,7 +182,7 @@ func (s HttpStores) Use(id string) Store {
 	}
 	return HttpStore{
 		client: client,
-		base:   strings.TrimRight(s.Base, "/"),
+		base:   strings.TrimRight(s.Target, "/"),
 		id:     id,
 	}
 }
