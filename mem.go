@@ -49,7 +49,7 @@ func (s *MemStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 		m.Digest = d
 
 		if _, ok := s.es.Load(d); ok {
-			return Meta{}, ErrAlreadyExists
+			return m, ErrAlreadyExists
 		}
 	}
 
@@ -106,7 +106,7 @@ func (s *MemStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	}
 
 	if _, ok := s.es.LoadOrStore(d, e); ok {
-		return Meta{}, ErrAlreadyExists
+		return m, ErrAlreadyExists
 	}
 
 	b.refs++

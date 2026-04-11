@@ -13,7 +13,8 @@ type Stores interface {
 type Store interface {
 	// Add adds a new blob to the store with [Meta], reading the content from r.
 	// On success, it returns the complete [Meta] with the computed Digest.
-	// If a blob with the same digest already exists, it returns [ErrAlreadyExists].
+	// Returned [Meta] may have additional fields set by the store, such as "Content-Type".
+	// If a blob with the same digest already exists, it returns partial [Meta] with digest and [ErrAlreadyExists].
 	// If m.Digest is set and [ErrAlreadyExists] is returned, r is not consumed so integrity of the existing blob is not verified.
 	// If m.Digest is set and if it does not match the computed digest, it returns [ErrDigestMismatch].
 	// It may block until the blob is fully read from r even if the context is canceled, so it is caller's

@@ -35,7 +35,6 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	store := h.Stores.Use(id)
-	store = TraceStore{store}
 
 	d := Digest(digest_raw)
 	if d != "" {
@@ -62,6 +61,7 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case errors.Is(err, ErrNotExist):
 				http.Error(w, err.Error(), http.StatusNotFound)
 			case errors.Is(err, ErrAlreadyExists):
+				h.setMetaHeaders(w, m)
 				http.Error(w, err.Error(), http.StatusConflict)
 			case errors.Is(err, ErrDigestMismatch):
 				http.Error(w, err.Error(), http.StatusUnprocessableEntity)
@@ -214,10 +214,11 @@ func (s HttpStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	}
 	defer res.Body.Close()
 
+	m = s.parseMeta(res)
 	if err := s.parseErr(res); err != nil {
-		return Meta{}, err
+		return m, err
 	}
-	return s.parseMeta(res), nil
+	return m, nil
 }
 
 func (s HttpStore) Get(ctx context.Context, d Digest) (Meta, error) {

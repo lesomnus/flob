@@ -24,25 +24,31 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		ctx, x := x.New(t)
 		s := new_store(t)
 
-		labels := Labels{"Content-Type": {"text/plain"}}
+		labels := Labels{"Foo": {"bar"}}
 		added, err := s.Add(ctx, Meta{Labels: labels}, x.Reader())
 		x.NoError(err)
 		x.Eq(x.Digest(), string(added.Digest))
+		x.Contains(added.Labels, "Foo")
+		x.Len(added.Labels["Foo"], 1)
+		x.Eq("bar", added.Labels["Foo"][0])
 
 		got, err := s.Get(ctx, added.Digest)
 		x.NoError(err)
 		x.Eq(added.Digest, got.Digest)
-		x.Eq(int64(len(x.Data())), got.Size)
+		x.Contains(got.Labels, "Foo")
+		x.Len(got.Labels["Foo"], 1)
+		x.Eq("bar", got.Labels["Foo"][0])
 	})
-	t.Run("add duplicate returns ErrAlreadyExists", func(t *testing.T) {
+	t.Run("add duplicate returns digest and ErrAlreadyExists", func(t *testing.T) {
 		ctx, x := x.New(t)
 		s := new_store(t)
 
-		_, err := s.Add(ctx, Meta{}, x.Reader())
+		m, err := s.Add(ctx, Meta{}, x.Reader())
 		x.NoError(err)
 
-		_, err = s.Add(ctx, Meta{}, x.Reader())
+		got, err := s.Add(ctx, Meta{}, x.Reader())
 		x.ErrorIs(err, ErrAlreadyExists)
+		x.Eq(m.Digest, got.Digest)
 	})
 	t.Run("get missing returns ErrNotExist", func(t *testing.T) {
 		ctx, x := x.New(t)
