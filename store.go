@@ -34,26 +34,6 @@ type Store interface {
 	Erase(ctx context.Context, d Digest) error
 }
 
-type ErrorStore struct {
-	Err error
-}
-
-func (s ErrorStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
-	return Meta{}, s.Err
-}
-func (s ErrorStore) Get(ctx context.Context, d Digest) (Meta, error) {
-	return Meta{}, s.Err
-}
-func (s ErrorStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
-	return nil, Meta{}, s.Err
-}
-func (s ErrorStore) Label(ctx context.Context, d Digest, labels Labels) error {
-	return s.Err
-}
-func (s ErrorStore) Erase(ctx context.Context, d Digest) error {
-	return s.Err
-}
-
 type Meta struct {
 	Digest Digest
 	Labels Labels

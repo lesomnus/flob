@@ -5,9 +5,9 @@ import (
 )
 
 var (
-	ErrUnimplemented  error = errors.New("unimplemented")
-	ErrNotExist       error = errors.New("not exist")
-	ErrAlreadyExists  error = errors.New("already exists")
-	ErrInvalidDigest  error = errors.New("invalid digest")
-	ErrDigestMismatch error = errors.New("digest mismatch")
+	ErrUnimplemented  = errors.New("unimplemented")
+	ErrNotExist       = errors.New("not exist")
+	ErrAlreadyExists  = errors.New("already exists")
+	ErrInvalidDigest  = errors.New("invalid digest")
+	ErrDigestMismatch = errors.New("digest mismatch")
 )

@@ -58,9 +58,7 @@ func (s *MemStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 		return m, fmt.Errorf("read: %w", err)
 	}
 
-	h := Hash()
-	h.Write(data)
-	d := Digest(fmt.Sprintf("%x", h.Sum(nil)))
+	d := Digest(Canonical.FromBytes(data))
 	m.Size = int64(len(data))
 
 	if m.Digest == "" {

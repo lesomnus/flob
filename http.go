@@ -14,11 +14,11 @@ import (
 
 // HttpHandler servers [Stores] over HTTP.
 //
-//	POST   /{store-id}          - [Store.Add]
-//	POST   /{store-id}/{digest} - [Store.Add] with pre-computed digest
-//	HEAD   /{store-id}/{digest} - [Store.Get]
-//	GET    /{store-id}/{digest} - [Store.Open]
-//	PATCH  /{store-id}/{digest} - [Store.Label]
+//	  POST /{store-id}          - [Store.Add]
+//	  POST /{store-id}/{digest} - [Store.Add] with pre-computed digest
+//	  HEAD /{store-id}/{digest} - [Store.Get]
+//	   GET /{store-id}/{digest} - [Store.Open]
+//	 PATCH /{store-id}/{digest} - [Store.Label]
 //	DELETE /{store-id}/{digest} - [Store.Erase]
 //
 // Headers with the "Flob-" prefix are saved as labels and returned in the response
@@ -41,7 +41,7 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var err error
 		d, err = d.Sanitize()
 		if err != nil {
-			http.Error(w, "invalid digest", http.StatusBadRequest)
+			http.Error(w, "invalid digest: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 	} else if r.Method != http.MethodPost {

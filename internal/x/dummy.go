@@ -11,7 +11,7 @@ func (X) Data() []byte {
 }
 
 func (x X) Digest() string {
-	return fmt.Sprintf("%x", sha256.Sum256(x.Data()))
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(x.Data()))
 }
 
 func (x X) Reader() *bytes.Reader {

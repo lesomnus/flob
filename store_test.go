@@ -7,7 +7,7 @@ import (
 	"github.com/lesomnus/flob/internal/x"
 )
 
-var digest_nil = Digest("0000000000000000000000000000000000000000000000000000000000000000")
+var digest_nil = Digest("sha256:0000000000000000000000000000000000000000000000000000000000000000")
 
 type newStoresFn func(t *testing.T) Stores
 

@@ -7,17 +7,19 @@ package flob
 // │      └- labels
 // ├─ locks/
 // │  └─ xxxxx...
-// ├─ blobs/
-// │  └─ xx/
+// ├─ share/
+// │  └─ (algo)/
 // │     └─ xx/
-// │        └─ xxxx...
+// │        └─ xx/
+// │           └─ xxxx...
 // └─ repos/
 //    └─ (id)/
-//       └─ xx/
+//       └─ (algo)/
 //          └─ xx/
-//             └─ xxxx.../
-//                ├- blob
-//                └- labels
+//             └─ xx/
+//                └─ xxxx.../
+//                   ├- blob
+//                   └- labels
 
 import (
 	"context"
@@ -91,7 +93,7 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	defer os.Remove(tp)
 	defer tf.Close()
 
-	h := Hash()
+	h := Canonical.Hash()
 	n, err := io.Copy(io.MultiWriter(tf, h), r)
 	if err != nil {
 		return m, fmt.Errorf("write temp blob: %w", err)
@@ -102,7 +104,7 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 
 	m.Size = n
 
-	d := Digest(fmt.Sprintf("%x", h.Sum(nil)))
+	d := Digest(fmt.Sprintf("sha256:%x", h.Sum(nil)))
 	pb := s.pathToRepo(d, "blob")
 	if m.Digest == "" {
 		m.Digest = d
@@ -393,14 +395,14 @@ func (s OsStore) checkDup(p string) error {
 }
 
 func (s OsStore) pathToBlob(d Digest) string {
-	v := string(d)
-	return filepath.Join(s.root, "blobs", v[0:2], v[2:4], v[4:])
+	v := d.Encoded()
+	return filepath.Join(s.root, "share", d.Algorithm().String(), v[0:2], v[2:4], v[4:])
 }
 
 func (s OsStore) pathToRepo(d Digest, elem ...string) string {
-	v := string(d)
-	parts := make([]string, 0, 4+len(elem))
-	parts = append(parts, s.repo, v[0:2], v[2:4], v[4:])
+	v := d.Encoded()
+	parts := make([]string, 0, 5+len(elem))
+	parts = append(parts, s.repo, d.Algorithm().String(), v[0:2], v[2:4], v[4:])
 	parts = append(parts, elem...)
 	return filepath.Join(parts...)
 }
