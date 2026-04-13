@@ -154,5 +154,5 @@ type StoreConfigFallback struct {
 	Secondary string `yaml:",omitempty"`
 	// SecondaryId is used to access the secondary store.
 	// Default values is "_".
-	SecondaryId string `yaml:",omitempty"`
+	SecondaryId string `yaml:"secondary_id,omitempty"`
 }
