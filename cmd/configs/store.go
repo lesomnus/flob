@@ -11,6 +11,7 @@ import (
 
 	"github.com/goccy/go-yaml/ast"
 	"github.com/lesomnus/flob"
+	"github.com/lesomnus/otx"
 	"github.com/lesomnus/otx/otxhttp"
 	"github.com/lesomnus/z"
 )
@@ -51,7 +52,7 @@ func (c StoresConfig) build(ctx context.Context, k string) (s flob.Stores, err e
 
 	case *StoresConfigHttp:
 		client := *http.DefaultClient
-		client.Transport = otxhttp.NewTransport(client.Transport)
+		client.Transport = otxhttp.NewTransport(otx.From(ctx), client.Transport)
 
 		return flob.HttpStores{
 			Client: &client,

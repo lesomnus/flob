@@ -34,7 +34,8 @@ func NewCmdServe() *xli.Command {
 
 			h := flob.HttpHandler{Stores: s, Redirect: c.Server.Redirect}
 			mux := http.NewServeMux()
-			mux.Handle("/", otxhttp.NewHandler(otx.From(ctx), otxhttp.BoundaryLogger()(h), "/"))
+			x := otx.From(ctx)
+			mux.Handle("/", otxhttp.NewHandler(x, otxhttp.BoundaryLogger(x)(h), "/"))
 
 			// Listen on the configured address (server.addr, e.g. "tcp4:0.0.0.0:8087";
 			// defaults to "0.0.0.0:8080" — see configs.ServerConfig.Evaluate). Split
