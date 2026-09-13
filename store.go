@@ -3,6 +3,7 @@ package flob
 import (
 	"context"
 	"io"
+	"iter"
 	"time"
 )
 
@@ -88,4 +89,98 @@ func (m *Meta) Clone() Meta {
 	m_ := *m
 	m_.Labels = cloneLabels(m.Labels)
 	return m_
+}
+
+// Linker is an optional capability for adding a reference to an existing blob
+// without reading or copying its content. The source and destination must share
+// a compatible backing pool: the same filesystem root, MemStores instance, or
+// S3Stores instance. Link copies source labels independently into the destination.
+type Linker interface {
+	// Link adds d to the destination using from's existing reference. It returns
+	// ErrNotExist if the source does not contain d, including when the destination
+	// already contains it. Otherwise an existing destination returns
+	// ErrAlreadyExists with partial metadata and without changing its labels.
+	// Invalid digests return the
+	// validation error from Digest.Sanitize; incompatible sources return
+	// ErrIncompatibleStore.
+	// Source decorators exposing Unwrap() Store are followed to the underlying
+	// store. CacheStore and FallbackStore therefore expose only their primary
+	// store as the source; their read fallbacks do not apply.
+	Link(ctx context.Context, d Digest, from Store) (Meta, error)
+}
+
+// AsLinker returns the first Linker in s's decorator chain, following Unwrap()
+// Store methods, or false if none is found. CacheStore and FallbackStore expose
+// their primary store. Decorator Add policies, including duplicate handling and
+// digest preparation, are not automatically applied to Link.
+func AsLinker(s Store) (Linker, bool) {
+	for s != nil {
+		if l, ok := s.(Linker); ok {
+			return l, true
+		}
+		u, ok := s.(storeUnwrapper)
+		if !ok {
+			return nil, false
+		}
+		s = u.Unwrap()
+	}
+	return nil, false
+}
+
+func unwrapLinkSource(s Store) Store {
+	for s != nil {
+		u, ok := s.(storeUnwrapper)
+		if !ok {
+			return s
+		}
+		s = u.Unwrap()
+	}
+	return nil
+}
+
+// Walker optionally inventories blobs physically held in a store's namespace.
+// Walk yields lazy Info values without promising order or a coherent snapshot.
+// Concurrent changes may be omitted. A failure is yielded once, then iteration
+// stops. Breaking iteration stops further work; cancellation yields ctx.Err().
+type Walker interface {
+	Walk(context.Context) iter.Seq2[Info, error]
+}
+
+// Namespacer optionally inventories namespaces containing at least one valid
+// blob reference. Merely calling Use does not create an enumerable namespace.
+// Namespaces has the same ordering, snapshot, cancellation, and error semantics
+// as Walker.Walk.
+type Namespacer interface {
+	Namespaces(context.Context) iter.Seq2[string, error]
+}
+
+// AsWalker follows Unwrap() Store to discover physical inventory support.
+// For cache/fallback decorators this inventories the primary, not a union.
+func AsWalker(s Store) (Walker, bool) {
+	for s != nil {
+		if w, ok := s.(Walker); ok {
+			return w, true
+		}
+		u, ok := s.(interface{ Unwrap() Store })
+		if !ok {
+			break
+		}
+		s = u.Unwrap()
+	}
+	return nil, false
+}
+
+// AsNamespacer follows Unwrap() Stores to discover namespace inventory support.
+func AsNamespacer(s Stores) (Namespacer, bool) {
+	for s != nil {
+		if n, ok := s.(Namespacer); ok {
+			return n, true
+		}
+		u, ok := s.(interface{ Unwrap() Stores })
+		if !ok {
+			break
+		}
+		s = u.Unwrap()
+	}
+	return nil, false
 }

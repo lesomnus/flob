@@ -314,3 +314,208 @@ func TestOsStoreAddWithoutASystemTempDir(t *testing.T) {
 		t.Fatalf("stat: %v", err)
 	}
 }
+
+func TestOsLinkSharesSourceInode(t *testing.T) {
+	stores := NewOsStores(t.TempDir())
+	source := stores.Use("source").(OsStore)
+	target := stores.Use("target").(OsStore)
+	m, err := source.Add(t.Context(), Meta{Labels: Labels{"Owner": {"source"}}}, strings.NewReader("content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A source repo's surviving hard link must be enough even if the shared
+	// global path was reclaimed during a prior Add/Erase race.
+	if err := os.Remove(source.pathToBlob(m.Digest)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Link(t.Context(), m.Digest, source); err != nil {
+		t.Fatal(err)
+	}
+	a, err := os.Stat(source.pathToRepo(m.Digest, "blob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.Stat(target.pathToRepo(m.Digest, "blob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(a, b) {
+		t.Fatal("Link copied content instead of sharing the source inode")
+	}
+	if err := source.Erase(t.Context(), m.Digest); err != nil {
+		t.Fatal(err)
+	}
+	r, _, err := target.Open(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil || string(data) != "content" {
+		t.Fatalf("linked content = %q, %v", data, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(stores.Root(), "stage"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("stage leftovers = %v, %v", entries, err)
+	}
+}
+
+func TestOsLinkLabelsFailureLeavesNoDestination(t *testing.T) {
+	stores := NewOsStores(t.TempDir())
+	source := stores.Use("source").(OsStore)
+	target := stores.Use("target").(OsStore)
+	m, err := source.Add(t.Context(), Meta{}, strings.NewReader("content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := source.pathToRepo(m.Digest, "labels")
+	if err := os.Remove(labels); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(labels, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Link(t.Context(), m.Digest, source); err == nil {
+		t.Fatal("Link ignored invalid labels")
+	}
+	if _, err := target.Stat(t.Context(), m.Digest); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("destination Stat = %v", err)
+	}
+}
+
+func TestOsLinkSourceEraseRace(t *testing.T) {
+	stores := NewOsStores(t.TempDir())
+	source := stores.Use("source").(OsStore)
+	for range 30 {
+		m, err := source.Add(t.Context(), Meta{}, strings.NewReader("content"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := stores.Use("target").(OsStore)
+		var linkErr, eraseErr error
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() { <-start; _, linkErr = target.Link(t.Context(), m.Digest, source) })
+		wg.Go(func() { <-start; eraseErr = source.Erase(t.Context(), m.Digest) })
+		close(start)
+		wg.Wait()
+		if eraseErr != nil {
+			t.Fatal(eraseErr)
+		}
+		if linkErr != nil && !errors.Is(linkErr, ErrNotExist) {
+			t.Fatalf("Link race error: %v", linkErr)
+		}
+		if linkErr == nil {
+			r, _, err := target.Open(t.Context(), m.Digest)
+			if err != nil {
+				t.Fatalf("successful Link lost content: %v", err)
+			}
+			data, err := io.ReadAll(r)
+			r.Close()
+			if err != nil || string(data) != "content" {
+				t.Fatalf("linked content = %q, %v", data, err)
+			}
+		}
+		if err := target.Erase(t.Context(), m.Digest); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestOsWalkSkipsMalformedAndSymlinkEntries(t *testing.T) {
+	stores := NewOsStores(t.TempDir())
+	s := stores.Use("valid").(OsStore)
+	m, err := s.Add(t.Context(), Meta{}, strings.NewReader("content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := []string{
+		filepath.Join(s.repo, "sha256", "00", "00", "bad", "blob"),
+		filepath.Join(s.repo, "unknown", "00", "00", strings.Repeat("0", 60), "blob"),
+		filepath.Join(s.repo, "sha256", "000", "0", strings.Repeat("0", 60), "blob"),
+	}
+	for _, path := range bad {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("invalid"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orphan := stores.Use("orphan").(OsStore).pathToRepo(m.Digest, "labels")
+	if err := os.MkdirAll(filepath.Dir(orphan), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphan, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Neither an aliased namespace nor a symlink pretending to be a blob is
+	// inventory. Walk must not escape through filesystem links.
+	if err := os.Symlink(s.repo, filepath.Join(stores.Root(), "repos", "alias")); err != nil {
+		t.Fatal(err)
+	}
+	link := stores.Use("symlink").(OsStore).pathToRepo(m.Digest, "blob")
+	if err := os.MkdirAll(filepath.Dir(link), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(s.pathToRepo(m.Digest, "blob"), link); err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for info, err := range s.Walk(t.Context()) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Digest() != m.Digest {
+			t.Fatalf("unexpected digest %s", info.Digest())
+		}
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("Walk count = %d", count)
+	}
+	var ids []string
+	for id, err := range stores.Namespaces(t.Context()) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) != 1 || ids[0] != "valid" {
+		t.Fatalf("namespaces = %q", ids)
+	}
+}
+
+func TestOsWalkDoesNotReadLabels(t *testing.T) {
+	s := NewOsStores(t.TempDir()).Use("namespace").(OsStore)
+	m, err := s.Add(t.Context(), Meta{}, strings.NewReader("content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := s.pathToRepo(m.Digest, "labels")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	var result Info
+	for info, err := range s.Walk(t.Context()) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		result = info
+	}
+	if result == nil || result.Size() != 7 {
+		t.Fatalf("Info = %v", result)
+	}
+	if _, err := result.Labels(t.Context()); err == nil {
+		t.Fatal("Labels ignored read failure")
+	}
+	if err := s.Erase(t.Context(), m.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := result.Labels(t.Context()); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("deleted labels error = %v", err)
+	}
+}
