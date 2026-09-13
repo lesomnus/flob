@@ -27,8 +27,8 @@ type HttpHandler struct {
 	Stores Stores
 
 	// Redirect, when true, serves GET by redirecting to a backend-provided
-	// presigned URL when the selected store implements [Presigner]; stores that
-	// do not (or a transient presign failure) fall back to streaming the blob.
+	// presigned URL when [AsPresigner] finds that capability. If unavailable or
+	// presigning fails (including [ErrNotExist]), it falls back to [Store.Open].
 	Redirect bool
 	// RedirectTTL bounds the validity of presigned redirect URLs. When zero,
 	// [DefaultRedirectTTL] is used.
@@ -130,11 +130,9 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("Cache-Control", "no-store")
 					http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
 					return
-				case errors.Is(err, ErrNotExist):
-					http.Error(w, err.Error(), http.StatusNotFound)
-					return
 				default:
-					// Transient presign failure: fall back to streaming below.
+					// Fall back to streaming, including when the primary misses:
+					// a wrapping store may still read from an origin or secondary.
 				}
 			}
 		}
