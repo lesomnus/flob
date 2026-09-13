@@ -23,11 +23,15 @@ func (s *presignTestStore) PresignOpen(ctx context.Context, d Digest, ttl time.D
 	if s.presignErr != nil {
 		return "", Meta{}, s.presignErr
 	}
-	m, err := s.Store.Get(ctx, d)
+	info, err := s.Store.Stat(ctx, d)
+	if err != nil {
+		return "", Meta{}, err
+	}
+	m, err := infoMeta(ctx, info)
 	return "https://example.test/blob", m, err
 }
 
-func (s *presignTestStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
+func (s *presignTestStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
 	s.openCalls++
 	return s.Store.Open(ctx, d)
 }
