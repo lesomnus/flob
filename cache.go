@@ -50,8 +50,8 @@ func (s CacheStore) Stat(ctx context.Context, d Digest) (Info, error) {
 
 // Open reads the blob from the primary store if it exists.
 // Otherwise, it reads from the origin store and caches it in the primary store as it is being read.
-// If the blob read from the origin store is not read to completion or is sought, it may not be cached
-// in the primary store, and the add operation is canceled.
+// Caching completes when all bytes have been read in order. Size probes and rereads of an
+// already-read prefix are supported; reading past a gap or closing early cancels the cache write.
 // Because adding to the primary store happens in a separate goroutine, Stat or Open may not be able to
 // read the blob from the primary store immediately after it has been read from the origin store.
 // This design assumes it is better to return the blob as soon as possible rather than wait for it to be
@@ -68,7 +68,7 @@ func (s CacheStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info
 		return nil, nil, err
 	}
 
-	r, sink := newBlobTap(r)
+	r, sink := newBlobTap(r, info.Size())
 	go func() {
 		// Labels are needed only for the best-effort cache write. Failure must
 		// not prevent streaming the origin's content.
@@ -94,37 +94,81 @@ func (s CacheStore) Erase(ctx context.Context, d Digest) error {
 }
 
 type blobTap struct {
-	w writeCloserWithError
-	r io.ReadSeekCloser
-	m Meta
+	w         *io.PipeWriter
+	r         io.ReadSeekCloser
+	offset    int64 // Current source position.
+	forwarded int64 // Contiguous prefix already sent to the cache.
+	size      int64
+	stopped   bool
 }
 
-func newBlobTap(src io.ReadSeekCloser) (*blobTap, *io.PipeReader) {
+func newBlobTap(src io.ReadSeekCloser, size int64) (*blobTap, *io.PipeReader) {
 	r, w := io.Pipe()
-	return &blobTap{w: w, r: src}, r
+	tap := &blobTap{w: w, r: src, size: size}
+	if size == 0 {
+		tap.stop(nil)
+	}
+	if size < 0 {
+		tap.stop(io.ErrUnexpectedEOF)
+	}
+	return tap, r
 }
 
 func (t *blobTap) Read(b []byte) (n int, err error) {
 	n, err = t.r.Read(b)
+	start := t.offset
+	t.offset += int64(n)
+	if t.stopped {
+		return n, err
+	}
+	// The origin's size is trusted for completion without an extra EOF read,
+	// but an observed read error or size mismatch must not commit a partial blob.
+	if err != nil && err != io.EOF {
+		t.stop(err)
+		return n, err
+	}
+	if n > 0 && t.offset > t.size {
+		t.stop(io.ErrUnexpectedEOF)
+		return n, err
+	}
+	// An EOF probe beyond the forwarded prefix may be followed by a rewind.
+	// Only EOF while reading the contiguous prefix proves truncation.
+	if err == io.EOF && start <= t.forwarded && t.offset < t.size {
+		t.stop(io.ErrUnexpectedEOF)
+		return n, err
+	}
 	if n > 0 {
-		if _, err_ := t.w.Write(b[:n]); err_ != nil {
-			t.stop(err_)
+		if start > t.forwarded {
+			t.stop(io.ErrUnexpectedEOF)
+			return n, err
+		}
+		if t.offset > t.forwarded {
+			skip := t.forwarded - start
+			written, writeErr := t.w.Write(b[int(skip):n])
+			t.forwarded += int64(written)
+			if writeErr != nil {
+				t.stop(writeErr)
+				return n, err
+			}
 		}
 	}
-	if err != nil {
-		t.stop(err)
+	if t.forwarded == t.size {
+		t.stop(nil)
 	}
 	return n, err
 }
 
 func (t *blobTap) Seek(offset int64, whence int) (int64, error) {
-	// Stop tapping if the blob is seeked, because the content may be read in a non-sequential way and
-	// it may cause integrity issues.
-	// Maybe if the seek is within the already read content, it can be still tapped, but for simplicity,
-	// just stop tapping on any seek for now.
-	t.stop(io.ErrUnexpectedEOF)
-
-	return t.r.Seek(offset, whence)
+	position, err := t.r.Seek(offset, whence)
+	if err != nil || position < 0 {
+		// A failed seek may have moved the source; its next position is unknown.
+		t.stop(io.ErrUnexpectedEOF)
+	} else {
+		// A probe may temporarily move past untapped bytes and then rewind. Only
+		// reading across such a gap makes the cache stream incomplete.
+		t.offset = position
+	}
+	return position, err
 }
 
 func (t *blobTap) Close() error {
@@ -133,21 +177,9 @@ func (t *blobTap) Close() error {
 }
 
 func (t *blobTap) stop(err error) {
+	if t.stopped {
+		return
+	}
+	t.stopped = true
 	t.w.CloseWithError(err)
-	t.w = discardSink{}
-}
-
-type writeCloserWithError interface {
-	io.Writer
-	CloseWithError(err error) error
-}
-
-type discardSink struct{}
-
-func (s discardSink) Write(b []byte) (n int, err error) {
-	return len(b), nil
-}
-
-func (s discardSink) CloseWithError(err error) error {
-	return nil
 }
