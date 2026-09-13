@@ -2,9 +2,18 @@ package flob
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"hash"
 	"io"
 	"iter"
+	"reflect"
 	"time"
+
+	"github.com/opencontainers/go-digest"
 )
 
 type Stores interface {
@@ -183,4 +192,271 @@ func AsNamespacer(s Stores) (Namespacer, bool) {
 		s = u.Unwrap()
 	}
 	return nil, false
+}
+
+// Stager optionally provides namespace-scoped, resumable uploads. Begin fixes
+// the digest algorithm (empty selects Canonical). Resume does not extend expiry.
+// OS and S3 stages survive process restarts; memory stages live with their pool.
+type Stager interface {
+	Begin(context.Context, digest.Algorithm) (Stage, error)
+	Resume(context.Context, string) (Stage, error)
+}
+
+// Stage is a handle, not an open file or connection. Each operation acquires and
+// releases its own resources. IDs are opaque and usable only in their namespace.
+type Stage interface {
+	ID() string
+	Stat(context.Context) (StageInfo, error)
+	// Append atomically publishes all of r, or none of it, at expectedOffset.
+	// The returned position is the new durable offset. A lost response leaves
+	// the outcome uncertain: use Stat before retrying. Conflicting writers may
+	// have consumed input before detecting a conflict. Callers must arrange to
+	// interrupt a blocking input reader when the operation context is canceled.
+	Append(ctx context.Context, expectedOffset int64, r io.Reader) (int64, error)
+	// Commit verifies the digest and freezes labels before making the blob
+	// visible. Size is derived from stored bytes. Empty Digest uses the computed
+	// digest. Retrying the same commit returns its recorded result; different
+	// parameters conflict. An existing blob is success with its existing labels.
+	Commit(context.Context, Meta) (Meta, error)
+	// Abort is idempotent. A commit already in progress is recovered first;
+	// aborting or pruning its stage never deletes a published blob.
+	Abort(context.Context) error
+}
+
+type StageState string
+
+const (
+	StageActive     StageState = "active"
+	StageCommitting StageState = "committing"
+	StageCommitted  StageState = "committed"
+	StageAborted    StageState = "aborted"
+)
+
+// StageInfo is a fresh snapshot; obtaining it does not extend the stage lifetime.
+type StageInfo struct {
+	Algorithm digest.Algorithm
+	Offset    int64
+	State     StageState
+	ExpiresAt time.Time
+}
+
+// StageConfig controls server-owned upload lifetimes. Nonpositive durations use
+// defaults: 24 hours idle TTL, 24 hours terminal receipt retention, 15 minutes
+// per operation. Only a successful Append renews an active stage's TTL.
+// Configuration must remain fixed after constructing a pool.
+type StageConfig struct {
+	TTL              time.Duration
+	Retention        time.Duration
+	OperationTimeout time.Duration
+	now              func() time.Time
+}
+
+func (c StageConfig) normalized() StageConfig {
+	if c.TTL <= 0 {
+		c.TTL = 24 * time.Hour
+	}
+	if c.Retention <= 0 {
+		c.Retention = 24 * time.Hour
+	}
+	if c.OperationTimeout <= 0 {
+		c.OperationTimeout = 15 * time.Minute
+	}
+	return c
+}
+func (c StageConfig) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// StageCleaner is a pool-wide maintenance capability. The host invokes it on a
+// schedule; flob does not start a background sweeper. PruneStages removes expired
+// stages and abandoned temporary data, skipping active operations and recovering
+// interrupted commits before deletion. The count is removed stage records;
+// cleanup may have made progress even when it returns an error.
+type StageCleaner interface {
+	PruneStages(context.Context) (int, error)
+}
+
+func AsStager(s Store) (Stager, bool) {
+	for s != nil {
+		if st, ok := s.(Stager); ok {
+			return st, true
+		}
+		u, ok := s.(storeUnwrapper)
+		if !ok {
+			break
+		}
+		s = u.Unwrap()
+	}
+	return nil, false
+}
+func AsStageCleaner(s Stores) (StageCleaner, bool) {
+	for s != nil {
+		if st, ok := s.(StageCleaner); ok {
+			return st, true
+		}
+		u, ok := s.(interface{ Unwrap() Stores })
+		if !ok {
+			break
+		}
+		s = u.Unwrap()
+	}
+	return nil, false
+}
+
+// Versioned checkpoint shared by implementations. A checkpoint describes only
+// committed append bytes; unreferenced attempt data is never part of its hash.
+type stageRecord struct {
+	Version   int
+	ID        string
+	Namespace string // Canonical namespaceSegment encoding preserves arbitrary bytes in JSON.
+	Algorithm digest.Algorithm
+	Offset    int64
+	Hash      []byte
+	State     StageState
+	ExpiresAt time.Time
+	Commit    Meta
+	Result    Meta
+}
+
+func newStageRecord(namespace string, algo digest.Algorithm, cfg StageConfig) (stageRecord, error) {
+	if algo == "" {
+		algo = Canonical
+	}
+	h, err := stageHashRestore(algo, nil)
+	if err != nil {
+		return stageRecord{}, err
+	}
+	state, err := stageHashState(h)
+	if err != nil {
+		return stageRecord{}, err
+	}
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return stageRecord{}, err
+	}
+	return stageRecord{Version: 1, ID: hex.EncodeToString(id[:]), Namespace: namespaceSegment(namespace), Algorithm: algo, Hash: state, State: StageActive, ExpiresAt: cfg.clock().Add(cfg.normalized().TTL)}, nil
+}
+func validStageID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for _, c := range id {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+func stageHashRestore(algo digest.Algorithm, state []byte) (hash.Hash, error) {
+	switch algo {
+	case digest.SHA256, digest.SHA384, digest.SHA512:
+	default:
+		return nil, fmt.Errorf("%w: algorithm %q", ErrInvalidDigest, algo)
+	}
+	h := algo.Hash()
+	if len(state) > 0 {
+		u, ok := h.(encoding.BinaryUnmarshaler)
+		if !ok {
+			return nil, ErrStageFormat
+		}
+		if err := u.UnmarshalBinary(state); err != nil {
+			return nil, fmt.Errorf("%w: hash checkpoint: %v", ErrStageFormat, err)
+		}
+	}
+	return h, nil
+}
+func stageHashState(h hash.Hash) ([]byte, error) {
+	m, ok := h.(encoding.BinaryMarshaler)
+	if !ok {
+		return nil, ErrStageFormat
+	}
+	return m.MarshalBinary()
+}
+func (r stageRecord) info() StageInfo {
+	return StageInfo{Algorithm: r.Algorithm, Offset: r.Offset, State: r.State, ExpiresAt: r.ExpiresAt}
+}
+func (r stageRecord) expired(now time.Time) bool { return !now.Before(r.ExpiresAt) }
+func (r stageRecord) prepareCommit(m Meta) (Meta, error) {
+	if err := r.validate(); err != nil {
+		return Meta{}, err
+	}
+	h, err := stageHashRestore(r.Algorithm, r.Hash)
+	if err != nil {
+		return Meta{}, err
+	}
+	computed := Digest(fmt.Sprintf("%s:%x", r.Algorithm, h.Sum(nil)))
+	if m.Digest != "" {
+		d, err := m.Digest.Sanitize()
+		if err != nil {
+			return Meta{}, err
+		}
+		if d != computed {
+			return Meta{}, ErrDigestMismatch
+		}
+	}
+	m = m.Clone()
+	m.Digest = computed
+	m.Size = r.Offset
+	return m, nil
+}
+func stageCommitMatches(a, b Meta) bool {
+	return a.Digest == b.Digest && a.Size == b.Size && reflect.DeepEqual(a.Labels, b.Labels)
+}
+
+// Readers cannot be forcibly interrupted through io.Reader alone. Network
+// handlers should close their input on cancellation, as with Store.Add.
+type stageContextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r stageContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.r.Read(p)
+	if canceled := r.ctx.Err(); canceled != nil {
+		return n, canceled
+	}
+	return n, err
+}
+
+// Version 1 uses Go's SHA-2 binary checkpoint format. Its final uint64 is the
+// number of input bytes, and must agree with the manifest's published offset.
+func (r stageRecord) validate() error {
+	namespace, err := namespaceID(r.Namespace)
+	if err != nil || namespaceSegment(namespace) != r.Namespace {
+		return ErrStageFormat
+	}
+	if r.Version != 1 || !validStageID(r.ID) || r.Offset < 0 || len(r.Hash) < 8 {
+		return ErrStageFormat
+	}
+	h, err := stageHashRestore(r.Algorithm, r.Hash)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrStageFormat, err)
+	}
+	if binary.BigEndian.Uint64(r.Hash[len(r.Hash)-8:]) != uint64(r.Offset) {
+		return ErrStageFormat
+	}
+	switch r.State {
+	case StageActive, StageCommitting, StageCommitted, StageAborted:
+	default:
+		return ErrStageFormat
+	}
+	if r.ExpiresAt.IsZero() {
+		return ErrStageFormat
+	}
+	if r.State == StageCommitting || r.State == StageCommitted {
+		computed := Digest(fmt.Sprintf("%s:%x", r.Algorithm, h.Sum(nil)))
+		if r.Commit.Digest != computed || r.Commit.Size != r.Offset {
+			return ErrStageFormat
+		}
+		if r.State == StageCommitted && (r.Result.Digest != computed || r.Result.Size != r.Offset) {
+			return ErrStageFormat
+		}
+	}
+	return nil
 }
