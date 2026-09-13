@@ -12,12 +12,11 @@ package flob
 // A blob is content-addressed, so identical content from any store resolves to
 // the same blob/ key and is uploaded once. Visibility is per store: a blob is
 // observable from a store only if that store's refs/ marker exists, and every
-// existence decision (Stat/Open/Label/Add's dup check) reads the marker, never
-// the shared blob/ object. Erase removes the marker and, when no marker remains
-// for the digest, best-effort removes the shared blob.
+// visibility decision (Stat/Open/Label/Add's dup check) reads the marker. Open
+// additionally checks the shared object's availability and representation.
+// Erase removes only the namespace reference.
 
 import (
-	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -421,33 +420,31 @@ func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, 
 	labels, size := metaToLabels(hres.Header)
 	hres.Body.Close()
 
-	// Fetch the shared bytes. The blob is downloaded into memory to satisfy
-	// io.ReadSeekCloser, matching HttpStore.Open.
-	req, err := s.stores.newRequest(ctx, http.MethodGet, s.stores.blobKey(d), nil, nil)
+	// The reference authorizes access; a separate blob HEAD preserves Open's
+	// missing-object check and captures its representation validator and size.
+	blob, err := s.stores.head(ctx, s.stores.blobKey(d))
 	if err != nil {
 		return nil, nil, err
 	}
-	res, err := s.stores.send(req, emptyPayloadHash)
-	if err != nil {
-		return nil, nil, err
+	defer blob.Body.Close()
+	if size < 0 || blob.ContentLength != size || !identityResponse(blob) {
+		return nil, nil, fmt.Errorf("blob size %d disagrees with reference size %d", blob.ContentLength, size)
 	}
-	defer res.Body.Close()
-	switch res.StatusCode {
-	case http.StatusOK:
-		// ok
-	case http.StatusNotFound:
-		// Reference exists but shared blob is gone (a lost dedup race); the
-		// content is not readable, so report it as missing.
-		return nil, nil, ErrNotExist
-	default:
-		return nil, nil, statusError("get blob", res)
-	}
-
-	data, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read blob: %w", err)
-	}
-	return nopCloser{bytes.NewReader(data)}, NewInfo(d, size, func(context.Context) (Labels, error) { return labels, nil }), nil
+	blobURL := responseURL(blob)
+	reader := newHTTPRangeReader(ctx, size, blobURL, blobURL, blob.Header.Get("ETag"), true,
+		func(ctx context.Context, _ string, offset int64, etag string) (*http.Response, error) {
+			req, err := s.stores.newRequest(ctx, http.MethodGet, s.stores.blobKey(d), nil, nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Accept-Encoding", "identity")
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, size-1))
+			if etag != "" {
+				req.Header.Set("If-Match", etag)
+			}
+			return s.stores.send(req, emptyPayloadHash)
+		})
+	return reader, NewInfo(d, size, func(context.Context) (Labels, error) { return labels, nil }), nil
 }
 
 // PresignOpen implements [Presigner]: it returns a short-lived direct download

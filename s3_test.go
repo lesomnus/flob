@@ -1,6 +1,7 @@
 package flob
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/xml"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,11 +140,9 @@ func (m *mockS3) getOrHead(w http.ResponseWriter, r *http.Request, key string, b
 		// client canonicalizes it on receipt.
 		h[name] = []string{value}
 	}
-	h.Set("Content-Length", strconv.Itoa(len(obj.data)))
-	w.WriteHeader(http.StatusOK)
-	if body {
-		w.Write(obj.data)
-	}
+	h.Set("ETag", fmt.Sprintf(`"%x"`, sha256.Sum256(obj.data)))
+	h.Set("Content-Type", "application/octet-stream")
+	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(obj.data))
 }
 
 func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
@@ -888,5 +888,168 @@ func TestS3EnumerationStops(t *testing.T) {
 				t.Fatalf("token loop: %d", calls)
 			}
 		})
+	}
+}
+
+func TestS3StoreLazyRanges(t *testing.T) {
+	stores, _ := newMockS3Stores(t)
+	store := stores.Use("t")
+	const content = "0123456789abcdefghijklmnopqrstuvwxyz"
+	m, err := store.Add(t.Context(), Meta{}, strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var methods, ranges, conditions []string
+	transport := stores.cl.Transport
+	stores.cl.Transport = rangeRoundTripper(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		methods = append(methods, req.Method)
+		if req.Method == http.MethodGet {
+			ranges = append(ranges, req.Header.Get("Range"))
+			conditions = append(conditions, req.Header.Get("If-Match"))
+		}
+		mu.Unlock()
+		return transport.RoundTrip(req)
+	})
+	reader, info, err := store.Open(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if info.Size() != int64(len(content)) {
+		t.Fatalf("size = %d", info.Size())
+	}
+	reader.Seek(0, io.SeekEnd)
+	reader.Seek(0, io.SeekStart)
+	mu.Lock()
+	if fmt.Sprint(methods) != "[HEAD HEAD]" {
+		t.Errorf("Open/probes requests = %v", methods)
+	}
+	mu.Unlock()
+	b := make([]byte, 4)
+	if _, err := io.ReadFull(reader, b); err != nil || string(b) != content[:4] {
+		t.Fatalf("first bytes = %q, %v", b, err)
+	}
+	reader.Seek(-5, io.SeekEnd)
+	got, err := io.ReadAll(reader)
+	if err != nil || string(got) != content[len(content)-5:] {
+		t.Fatalf("tail = %q, %v", got, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(ranges) != "[bytes=0-35 bytes=31-35]" {
+		t.Fatalf("ranges = %v", ranges)
+	}
+	etag := fmt.Sprintf(`"%x"`, sha256.Sum256([]byte(content)))
+	if len(conditions) != 2 || conditions[0] != etag || conditions[1] != etag {
+		t.Fatalf("If-Match = %v", conditions)
+	}
+}
+
+func TestS3StoreLazyMissingAndReplacement(t *testing.T) {
+	for _, mode := range []string{"missing before Open", "missing before Read", "replaced before Read", "size mismatch", "empty"} {
+		t.Run(mode, func(t *testing.T) {
+			stores, mock := newMockS3Stores(t)
+			store := stores.Use("t")
+			content := "content"
+			if mode == "empty" {
+				content = ""
+			}
+			m, err := store.Add(t.Context(), Meta{}, strings.NewReader(content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := stores.blobKey(m.Digest)
+			if mode == "missing before Open" {
+				mock.mu.Lock()
+				delete(mock.objects, key)
+				mock.mu.Unlock()
+			}
+			if mode == "size mismatch" {
+				mock.mu.Lock()
+				obj := mock.objects[key]
+				obj.data = []byte("x")
+				mock.objects[key] = obj
+				mock.mu.Unlock()
+			}
+			reader, _, err := store.Open(t.Context(), m.Digest)
+			if mode == "missing before Open" {
+				if !errors.Is(err, ErrNotExist) {
+					t.Fatalf("Open = %v", err)
+				}
+				return
+			}
+			if mode == "size mismatch" {
+				if err == nil {
+					reader.Close()
+					t.Fatal("size mismatch accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			if mode == "missing before Read" {
+				mock.mu.Lock()
+				delete(mock.objects, key)
+				mock.mu.Unlock()
+			}
+			if mode == "replaced before Read" {
+				mock.mu.Lock()
+				obj := mock.objects[key]
+				obj.data = []byte("changed")
+				mock.objects[key] = obj
+				mock.mu.Unlock()
+			}
+			got, err := io.ReadAll(reader)
+			if mode == "empty" {
+				if err != nil || len(got) != 0 {
+					t.Fatalf("empty read = %q, %v", got, err)
+				}
+				return
+			}
+			if mode == "missing before Read" && !errors.Is(err, ErrNotExist) {
+				t.Fatalf("Read = %v; want ErrNotExist", err)
+			}
+			if err == nil || len(got) != 0 {
+				t.Fatalf("changed/missing read = %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestHttpStoreLazyPresignedS3Redirect(t *testing.T) {
+	stores, _ := newMockS3Stores(t)
+	var now atomic.Int64
+	now.Store(time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC).Unix())
+	stores.signer.now = func() time.Time { return time.Unix(now.Load(), 0) }
+	const content = "0123456789abcdefghijklmnopqrstuvwxyz"
+	m, err := stores.Use("t").Add(t.Context(), Meta{}, strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(HttpHandler{Stores: stores, Redirect: true})
+	defer server.Close()
+	reader, info, err := (HttpStores{Client: server.Client(), Target: server.URL}).Use("t").Open(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if info.Digest() != m.Digest {
+		t.Fatalf("digest = %s", info.Digest())
+	}
+	first := make([]byte, 4)
+	if _, err := io.ReadFull(reader, first); err != nil || string(first) != content[:4] {
+		t.Fatalf("first = %q, %v", first, err)
+	}
+	// A fresh redirect would now have a different signed query. The reader
+	// must reuse its original final URL instead of minting another one.
+	now.Add(2)
+	reader.Seek(7, io.SeekStart)
+	got, err := io.ReadAll(reader)
+	if err != nil || string(got) != content[7:] {
+		t.Fatalf("redirected seek = %q, %v", got, err)
 	}
 }
