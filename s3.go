@@ -164,7 +164,7 @@ func (s *S3Stores) blobKey(d Digest) string {
 }
 
 func (s *S3Stores) refKey(d Digest, id string) string {
-	return s.prefix + "refs/" + d.Algorithm().String() + "/" + d.Encoded() + "/" + id
+	return s.prefix + "refs/" + d.Algorithm().String() + "/" + d.Encoded() + "/" + namespaceSegment(id)
 }
 
 // presignGet builds a presigned GET URL for an in-bucket key, valid for ttl. It

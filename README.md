@@ -51,6 +51,45 @@ semantics (cross-store dedup, per-store visibility):
   AWS SDK dependency; blobs are deduplicated by digest key and stores are isolated
   by per-store reference markers (see [`s3.md`](./s3.md)).
 
+## Namespace IDs
+
+`Use(id)` identifies a namespace by the exact bytes of `id`. OS directory names,
+S3 reference suffixes, and HTTP path segments use one shared encoding. Nonempty
+ASCII names containing only letters, digits, `_`, `-`, and `.` stay unchanged,
+except names ending in `.`, and Windows device names such as `NUL` or `CON.txt`.
+All other IDs become `~` followed by unpadded URL-safe base64 of their bytes.
+The prefix is reserved: an ID beginning with `~` is itself encoded. For example,
+`a/b` becomes `~YS9i`, `..` becomes `~Li4`, and the empty ID becomes `~`.
+Namespaces therefore occupy single segments under `repos/` or S3 `refs/`.
+
+Storage limits still apply. On filesystems with a 255-byte filename limit,
+encoded IDs can contain at most 190 bytes before encoding; preserved names can
+contain at most 255 bytes. Full path limits may impose smaller bounds, particularly
+on Windows. OS namespace isolation requires a case-sensitive filesystem; names
+that differ only by case are distinct IDs. S3's total key-length limit also
+includes the configured prefix and digest. Oversized names fail through backend
+operations; `Use` does not promise that every length can be stored.
+
+**Migration:** stores containing only preserved plain names need no migration.
+If any existing ID requires encoding, plan and export data **before upgrading**.
+Old and new layouts cannot safely be mixed: for example, a legacy raw namespace
+named `~Lg` occupies the new location for the ID `.`. Reading that location after
+upgrading would expose the old namespace through a different ID. This affects
+both OS directories and S3 reference suffixes, especially existing `~`-prefixed
+names. Names previously stored raw that now require encoding include slash,
+empty, dot, device, and `~`-prefixed IDs.
+
+For these layouts, export blobs and labels using the old version, then import
+through `Use(originalID)` into a **fresh store root or S3 prefix** using the new
+version before switching traffic. Keep the old data separately until verified.
+An in-place migration requires an offline, collision-aware relocation of all
+affected namespace references while preserving blob links and metadata; do not
+simply rename one entry while leaving conflicting legacy entries accessible.
+There is no automatic migration or fallback to unsafe raw paths. Update custom
+HTTP clients to use the encoded segment; `HttpStores` handles it automatically.
+Back up legacy layouts before migration, since old traversal IDs may have written
+outside `repos/` or the store root.
+
 ## Blob information and lazy labels
 
 `Store.Stat` checks existence and returns an `Info` with the blob's digest and

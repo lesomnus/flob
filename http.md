@@ -1,7 +1,13 @@
 # HTTP API
 
 `HttpHandler` exposes [Stores]-backed [Store] operations as a RESTful interface.
-The store is selected by the first path segment.
+The store is selected by the first path segment, using the reversible namespace
+encoding described in [Namespace IDs](README.md#namespace-ids). Plain IDs such as
+`repo-1` keep their existing URLs; `a/b` uses `/~YS9i` and the empty ID uses `/~`.
+IDs beginning with `~` must also be encoded. `HttpStores` and POST `Location`
+headers produce this format. Malformed or noncanonical base64 segments return
+400. The handler splits the escaped path before URL-unescaping each segment once,
+so percent escapes cannot introduce extra path segments or be decoded twice.
 
 URL structure:
 
