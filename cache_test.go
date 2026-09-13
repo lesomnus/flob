@@ -9,7 +9,7 @@ import (
 	"github.com/lesomnus/flob/internal/x"
 )
 
-// nonDrainingStores is a primary that never holds the blob (Open/Get always miss) and whose
+// nonDrainingStores is a primary that never holds the blob (Open/Stat always miss) and whose
 // Add returns immediately WITHOUT reading the supplied reader — mimicking a primary that
 // short-circuits because the blob was committed concurrently. It exercises the blobTap path
 // where Primary.Add does not drain the tee pipe.
@@ -22,9 +22,9 @@ type nonDrainingStore struct{}
 func (nonDrainingStore) Add(context.Context, Meta, io.Reader) (Meta, error) {
 	return Meta{}, ErrAlreadyExists
 }
-func (nonDrainingStore) Get(context.Context, Digest) (Meta, error) { return Meta{}, ErrNotExist }
-func (nonDrainingStore) Open(context.Context, Digest) (io.ReadSeekCloser, Meta, error) {
-	return nil, Meta{}, ErrNotExist
+func (nonDrainingStore) Stat(context.Context, Digest) (Info, error) { return nil, ErrNotExist }
+func (nonDrainingStore) Open(context.Context, Digest) (io.ReadSeekCloser, Info, error) {
+	return nil, nil, ErrNotExist
 }
 func (nonDrainingStore) Label(context.Context, Digest, Labels) error { return ErrNotExist }
 func (nonDrainingStore) Erase(context.Context, Digest) error         { return nil }
@@ -60,23 +60,23 @@ func TestCacheStore(t *testing.T) {
 		m, err := s.Primary.Add(ctx, Meta{}, x.Reader())
 		x.NoError(err)
 
-		_, err = s.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, s, m.Digest)
 		x.NoError(err)
 
-		_, err = s.Origin.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, s.Origin, m.Digest)
 		x.ErrorIs(err, ErrNotExist)
 	})
-	t.Run("get from origin not cached", func(t *testing.T) {
+	t.Run("stat from origin not cached", func(t *testing.T) {
 		ctx, x := x.New(t)
 		s := new_store(t)
 
 		m, err := s.Origin.Add(ctx, Meta{}, x.Reader())
 		x.NoError(err)
 
-		_, err = s.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, s, m.Digest)
 		x.NoError(err)
 
-		_, err = s.Primary.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, s.Primary, m.Digest)
 		x.ErrorIs(err, ErrNotExist)
 	})
 	t.Run("full read from origin makes cache", func(t *testing.T) {
@@ -97,7 +97,7 @@ func TestCacheStore(t *testing.T) {
 		// so we wait for a while before checking.
 		time.Sleep(30 * time.Millisecond)
 
-		_, err = s.Primary.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, s.Primary, m.Digest)
 		x.NoError(err)
 	})
 	t.Run("open does not deadlock when primary add short-circuits", func(t *testing.T) {
@@ -138,7 +138,7 @@ func TestCacheStore(t *testing.T) {
 		m, err := s.Add(ctx, Meta{}, x.Reader())
 		x.NoError(err)
 
-		_, err = s.Origin.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, s.Origin, m.Digest)
 		x.ErrorIs(err, ErrNotExist)
 	})
 }

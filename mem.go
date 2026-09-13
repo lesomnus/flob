@@ -111,38 +111,36 @@ func (s *MemStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return m.Clone(), nil
 }
 
-func (s *MemStore) Get(ctx context.Context, d Digest) (m Meta, err error) {
-	_, m, err = s.open(d)
-	return
+func (s *MemStore) Stat(ctx context.Context, d Digest) (Info, error) {
+	_, info, err := s.open(d)
+	return info, err
 }
 
-func (s *MemStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
-	entry, m, err := s.open(d)
+func (s *MemStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
+	entry, info, err := s.open(d)
 	if err != nil {
-		return nil, m, err
+		return nil, nil, err
 	}
-
-	return nopCloser{bytes.NewReader(entry.blob.data)}, m, nil
+	return nopCloser{bytes.NewReader(entry.blob.data)}, info, nil
 }
 
-func (s *MemStore) open(d Digest) (*memEntry, Meta, error) {
+func (s *MemStore) open(d Digest) (*memEntry, Info, error) {
 	v, ok := s.es.Load(d)
 	if !ok {
-		return nil, Meta{}, ErrNotExist
+		return nil, nil, ErrNotExist
 	}
-
 	entry := v.(*memEntry)
-	ls := entry.labels.Load()
-
-	m := Meta{
-		Digest: d,
-		Size:   int64(len(entry.blob.data)),
-	}
-	if ls != nil {
-		m.Labels = cloneLabels(*ls)
-	}
-
-	return entry, m, nil
+	info := NewInfo(d, int64(len(entry.blob.data)), func(ctx context.Context) (Labels, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		ls := entry.labels.Load()
+		if ls == nil {
+			return nil, nil
+		}
+		return *ls, nil
+	})
+	return entry, info, nil
 }
 
 func (s *MemStore) Label(ctx context.Context, d Digest, labels Labels) error {

@@ -100,7 +100,9 @@ Foo: bar
 HEAD /{store-id}/{digest}
 ```
 
-Retrieves blob metadata without downloading its content.
+Retrieves blob metadata without downloading its content. The handler calls
+`Stat` and loads labels to preserve the metadata headers on this endpoint.
+`HttpStore.Stat` retains the labels from this HEAD response for `Info.Labels`.
 Returns `404 Not Found` if the blob does not exist.
 
 Success response (`200 OK`):
