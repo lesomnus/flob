@@ -51,6 +51,41 @@ semantics (cross-store dedup, per-store visibility):
   AWS SDK dependency; blobs are deduplicated by digest key and stores are isolated
   by per-store reference markers (see [`s3.md`](./s3.md)).
 
+## Link a blob between namespaces
+
+`Linker` adds an existing blob to another namespace without reading, hashing, or
+copying the blob content. The filesystem, memory, and S3 backends support it:
+
+```go
+source := stores.Use("source")
+destination := stores.Use("destination")
+linker, ok := flob.AsLinker(destination)
+if !ok {
+    return flob.ErrUnimplemented
+}
+meta, err := linker.Link(ctx, digest, source)
+```
+
+The source must contain the digest in its own namespace; global blob presence
+alone is insufficient. `Link` copies its labels into independent destination
+metadata. Later label changes or deletion of the source do not affect the linked
+blob. An existing destination returns `ErrAlreadyExists` with partial metadata
+and keeps its labels. A missing source returns `ErrNotExist`, even if the
+destination already exists. Invalid digests return a validation error.
+
+Source and destination must share a backing pool: the same `MemStores` or
+`S3Stores` instance, or the same cleaned absolute filesystem root path. Other
+combinations return `ErrIncompatibleStore`; there is no automatic copy fallback.
+OS uses a staged hard link and atomic publication; memory shares the immutable
+blob and increments its reference count; S3 reads the source reference metadata
+and conditionally creates an empty destination reference.
+
+`AsLinker` follows `Unwrap` through decorators. Source decorators are also
+unwrapped, so cache/fallback stores participate through their primary only;
+origin-only blobs cannot be linked through them. Decorator policies on `Add`
+(such as `AllowDuplicates`) do not change `Link` behavior. HTTP does not expose a
+link endpoint or `Linker` capability.
+
 ## Namespace IDs
 
 `Use(id)` identifies a namespace by the exact bytes of `id`. OS directory names,
