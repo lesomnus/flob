@@ -20,6 +20,9 @@ type CacheStores struct {
 	Origin  Stores
 }
 
+// Unwrap exposes the primary pool's optional inventory capabilities.
+func (s *CacheStores) Unwrap() Stores { return s.Primary }
+
 func (s CacheStores) Use(id string) Store {
 	return CacheStore{
 		Primary: s.Primary.Use(id),
