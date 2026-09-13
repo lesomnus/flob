@@ -111,6 +111,15 @@ func (s *MemStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return m.Clone(), nil
 }
 
+// Stat implements [Stater] without copying labels.
+func (s *MemStore) Stat(ctx context.Context, d Digest) (int64, error) {
+	v, ok := s.es.Load(d)
+	if !ok {
+		return 0, ErrNotExist
+	}
+	return int64(len(v.(*memEntry).blob.data)), nil
+}
+
 func (s *MemStore) Get(ctx context.Context, d Digest) (m Meta, err error) {
 	_, m, err = s.open(d)
 	return

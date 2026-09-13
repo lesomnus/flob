@@ -382,6 +382,23 @@ func (s *S3Store) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return m.Clone(), nil
 }
 
+// Stat implements [Stater] with a HEAD of this store's reference marker.
+func (s *S3Store) Stat(ctx context.Context, d Digest) (int64, error) {
+	d, err := d.Sanitize()
+	if err != nil {
+		return 0, ErrNotExist
+	}
+	res, err := s.stores.head(ctx, s.stores.refKey(d, s.id))
+	if err != nil {
+		return 0, err
+	}
+	defer res.Body.Close()
+
+	// Reference markers are empty; their metadata holds the blob's size.
+	size, _ := strconv.ParseInt(res.Header.Get(metaPrefix+metaSizeKey), 10, 64)
+	return size, nil
+}
+
 func (s *S3Store) Get(ctx context.Context, d Digest) (Meta, error) {
 	d, err := d.Sanitize()
 	if err != nil {

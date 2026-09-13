@@ -247,6 +247,22 @@ func (s OsStore) moveStageToRepo(ps, pr string) error {
 	return fmt.Errorf("move from stage to repo after %d attempts: %w", attempts, err)
 }
 
+// Stat implements [Stater] with a single filesystem stat of the store's blob.
+func (s OsStore) Stat(ctx context.Context, d Digest) (int64, error) {
+	d, err := d.Sanitize()
+	if err != nil {
+		return 0, ErrNotExist
+	}
+	info, err := os.Stat(s.pathToRepo(d, "blob"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, ErrNotExist
+		}
+		return 0, fmt.Errorf("stat: %w", err)
+	}
+	return info.Size(), nil
+}
+
 func (s OsStore) Get(ctx context.Context, d Digest) (m Meta, err error) {
 	_, m, err = s.open(ctx, d)
 	return

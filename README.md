@@ -50,6 +50,29 @@ semantics (cross-store dedup, per-store visibility):
   AWS SDK dependency; blobs are deduplicated by SHA-256 key and stores are isolated
   by per-store reference markers (see [`s3.md`](./s3.md)).
 
+## Existence and size
+
+`Stater` is an optional capability for checking existence and size without
+retrieving labels. Discover it through decorators with `AsStater`:
+
+```go
+var size int64
+var err error
+if st, ok := flob.AsStater(store); ok {
+    size, err = st.Stat(ctx, digest)
+} else {
+    var meta flob.Meta
+    meta, err = store.Get(ctx, digest)
+    size = meta.Size
+}
+```
+
+The filesystem, memory, and S3 backends implement it. Filesystem `Stat` reads
+only the blob's file information; S3 sends a HEAD for the store's reference
+marker. Missing blobs return `ErrNotExist`, including blobs only present in
+another store. `CacheStore` and `FallbackStore` preserve their usual read
+fallbacks, using `Get` for children without this capability.
+
 ## Design & Consistency
 
 `flob` keeps no database. The filesystem layout *is* the index:

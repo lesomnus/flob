@@ -98,6 +98,16 @@ type FallbackStore struct {
 func (s FallbackStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return s.Primary.Add(ctx, m, r)
 }
+
+// Stat follows the same fallback policy as Get, using [Stater] when available.
+func (s FallbackStore) Stat(ctx context.Context, d Digest) (int64, error) {
+	size, err := stat(ctx, s.Primary, d)
+	if err == nil {
+		return size, nil
+	}
+	return stat(ctx, s.Secondary, d)
+}
+
 func (s FallbackStore) Get(ctx context.Context, d Digest) (Meta, error) {
 	m, err := s.Primary.Get(ctx, d)
 	if err == nil {

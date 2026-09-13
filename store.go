@@ -34,6 +34,40 @@ type Store interface {
 	Erase(ctx context.Context, d Digest) error
 }
 
+// Stater is an optional capability for checking a blob's existence and size
+// without retrieving its labels. Callers can use [AsStater] to discover it,
+// falling back to [Store.Get] when unavailable.
+type Stater interface {
+	// Stat returns the blob's size in bytes, or [ErrNotExist] if it does not
+	// exist in this store. Blobs in other stores are not visible.
+	Stat(ctx context.Context, d Digest) (size int64, err error)
+}
+
+// AsStater returns the first [Stater] in s's decorator chain, following
+// Unwrap() Store methods, or false if none is found. Decorators that change
+// read semantics must implement Stat themselves to preserve those semantics.
+func AsStater(s Store) (Stater, bool) {
+	for s != nil {
+		if st, ok := s.(Stater); ok {
+			return st, true
+		}
+		u, ok := s.(storeUnwrapper)
+		if !ok {
+			return nil, false
+		}
+		s = u.Unwrap()
+	}
+	return nil, false
+}
+
+func stat(ctx context.Context, s Store, d Digest) (int64, error) {
+	if st, ok := AsStater(s); ok {
+		return st.Stat(ctx, d)
+	}
+	m, err := s.Get(ctx, d)
+	return m.Size, err
+}
+
 // Presigner is an optional capability a [Store] may implement. Instead of
 // streaming a blob's bytes, it hands out a short-lived direct URL to download it
 // (e.g. an S3 presigned URL), letting a server redirect clients straight to the
