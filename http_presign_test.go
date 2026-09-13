@@ -39,7 +39,7 @@ func (s *presignTestStore) Open(ctx context.Context, d Digest) (io.ReadSeekClose
 func TestPrimaryPresigner(t *testing.T) {
 	wrappers := map[string]func(Store, Store) Store{
 		"cache": func(primary, fallback Store) Store {
-			return CacheStores{Primary: FixedStores{Store: primary}, Origin: FixedStores{Store: fallback}}.Use("t")
+			return (&CacheStores{Primary: FixedStores{Store: primary}, Origin: FixedStores{Store: fallback}}).Use("t")
 		},
 		"fallback": func(primary, fallback Store) Store {
 			return FallbackStores{Primary: FixedStores{Store: primary}, Secondary: fallback}.Use("t")
@@ -103,8 +103,14 @@ func TestPrimaryPresigner(t *testing.T) {
 							t.Fatal("redirect unexpectedly opened the primary blob")
 						}
 					} else {
-						if primary.openCalls != 1 {
-							t.Fatalf("open calls = %d; want 1", primary.openCalls)
+						wantOpenCalls := 1
+						if name == "cache" && !tc.primaryHasBlob {
+							// Cache miss leaders recheck after joining the flight
+							// in case an earlier fill committed in the meantime.
+							wantOpenCalls = 2
+						}
+						if primary.openCalls != wantOpenCalls {
+							t.Fatalf("open calls = %d; want %d", primary.openCalls, wantOpenCalls)
 						}
 						if response.Header().Get("Location") != "" {
 							t.Fatal("streaming response has redirect location")

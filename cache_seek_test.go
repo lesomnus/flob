@@ -14,10 +14,14 @@ import (
 
 type completedCacheStore struct {
 	Store
-	done chan error
+	done    chan error
+	started chan struct{}
 }
 
 func (s completedCacheStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
+	if s.started != nil {
+		close(s.started)
+	}
 	m, err := s.Store.Add(ctx, m, r)
 	s.done <- err
 	return m, err
@@ -42,8 +46,8 @@ func TestCacheServeContent(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			primary := completedCacheStore{Store: NewMemStores().Use("t"), done: make(chan error, 1)}
-			store := CacheStore{Primary: primary, Origin: origin}
+			primary := completedCacheStore{Store: NewMemStores().Use("t"), done: make(chan error, 1), started: make(chan struct{})}
+			store := &CacheStore{Primary: primary, Origin: origin}
 			response := httptest.NewRecorder()
 			request := httptest.NewRequest(http.MethodGet, "/t/"+string(meta.Digest), nil)
 			if mode == "handler" {
@@ -57,6 +61,9 @@ func TestCacheServeContent(t *testing.T) {
 					response.Header().Set("Content-Type", "application/octet-stream")
 				}
 				if mode == "range" {
+					// Ensure this case observes an aborted Add, rather than
+					// cancellation before the best-effort writer starts.
+					<-primary.started
 					request.Header.Set("Range", "bytes=1000-1999")
 				}
 				http.ServeContent(response, request, "", time.Time{}, r)

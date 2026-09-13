@@ -51,6 +51,26 @@ semantics (cross-store dedup, per-store visibility):
   AWS SDK dependency; blobs are deduplicated by digest key and stores are isolated
   by per-store reference markers (see [`s3.md`](./s3.md)).
 
+## Read-through cache
+
+Use `NewCacheStores(primary, origin)` for a cache shared across namespaces, or
+`NewCacheStore(primary, origin)` for one namespace. Concurrent misses for the
+same namespace and digest share the first cache fill, including across repeated
+`Use(id)` calls. The first caller streams immediately; later callers wait for the
+primary write to commit and can cancel their own wait independently. An aborted
+or failed fill releases waiters to fetch from the origin themselves.
+
+Cache writes are best-effort. Read the entire blob and close its reader to allow
+caching to finish. Size probes and rereads of a prefix are supported; incomplete
+reads and reads that skip a gap abort the fill. Leader cancellation also releases
+waiters and closes its source reader. Backends must honor operation contexts and
+allow `Close` to interrupt outstanding reads.
+
+`CacheStores` and `CacheStore` now implement their interfaces as pointers.
+Use the constructors or `&CacheStores{...}` / `&CacheStore{...}`. Do not copy them
+or change their `Primary` or `Origin` fields after first use. Coordination is
+instance-local, and completed flights retain neither digest nor namespace keys.
+
 ## Link a blob between namespaces
 
 `Linker` adds an existing blob to another namespace without reading, hashing, or

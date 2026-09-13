@@ -32,21 +32,21 @@ func (nonDrainingStore) Erase(context.Context, Digest) error         { return ni
 func TestCacheStore(t *testing.T) {
 	new_stores := func(t *testing.T) Stores {
 		t.Helper()
-		return CacheStores{
+		return &CacheStores{
 			Primary: NewMemStores(),
 			Origin:  NewMemStores(),
 		}
 	}
-	new_store := func(t *testing.T) CacheStore {
+	new_store := func(t *testing.T) *CacheStore {
 		t.Helper()
 		stores := new_stores(t)
-		return stores.Use("test").(CacheStore)
+		return stores.Use("test").(*CacheStore)
 	}
 
 	t.Run("contract", func(t *testing.T) {
 		testStore(t, func(t *testing.T) Stores {
 			t.Helper()
-			return CacheStores{
+			return &CacheStores{
 				Primary: NewMemStores(),
 				Origin:  NewMemStores(),
 			}
@@ -110,7 +110,7 @@ func TestCacheStore(t *testing.T) {
 		// Primary.Open misses (so Open taps the origin read), but Primary.Add returns
 		// immediately without draining the tee pipe. Before the fix, blobTap.Read blocked
 		// forever on the unbuffered pipe write and the caller's read hung.
-		s := CacheStores{Primary: nonDrainingStores{}, Origin: origin}.Use("t")
+		s := (&CacheStores{Primary: nonDrainingStores{}, Origin: origin}).Use("t")
 
 		done := make(chan []byte, 1)
 		go func() {

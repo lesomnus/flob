@@ -69,7 +69,7 @@ func (c StoresConfig) build(ctx context.Context, k string) (s flob.Stores, err e
 		if err != nil {
 			return nil, z.Err(err, "build origin store: %q", c_.Origin)
 		}
-		return flob.CacheStores{
+		return &flob.CacheStores{
 			Primary: primary,
 			Origin:  origin,
 		}, nil
