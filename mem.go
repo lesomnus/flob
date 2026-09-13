@@ -40,12 +40,14 @@ type MemStore struct {
 }
 
 func (s *MemStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
+	algo := Canonical
 	if m.Digest != "" {
 		d, err := m.Digest.Sanitize()
 		if err != nil {
 			return m, err
 		}
 		m.Digest = d
+		algo = d.Algorithm()
 
 		if _, ok := s.es.Load(d); ok {
 			return m, ErrAlreadyExists
@@ -57,7 +59,7 @@ func (s *MemStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 		return m, fmt.Errorf("read: %w", err)
 	}
 
-	d := Digest(Canonical.FromBytes(data))
+	d := Digest(algo.FromBytes(data))
 	m.Size = int64(len(data))
 
 	if m.Digest == "" {

@@ -66,6 +66,7 @@ type OsStore struct {
 }
 
 func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
+	algo := Canonical
 	if m.Digest != "" {
 		// Digest is provided, so check if the blob already exists.
 		d, err := m.Digest.Sanitize()
@@ -73,6 +74,7 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 			return m, err
 		}
 		m.Digest = d
+		algo = d.Algorithm()
 
 		pb := s.pathToRepo(m.Digest, "blob")
 		if err := s.checkDup(pb); err != nil {
@@ -105,7 +107,7 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	defer os.Remove(tp)
 	defer tf.Close()
 
-	h := Canonical.Hash()
+	h := algo.Hash()
 	n, err := io.Copy(io.MultiWriter(tf, h), r)
 	if err != nil {
 		return m, fmt.Errorf("write temp blob: %w", err)
@@ -116,7 +118,7 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 
 	m.Size = n
 
-	d := Digest(fmt.Sprintf("sha256:%x", h.Sum(nil)))
+	d := Digest(fmt.Sprintf("%s:%x", algo, h.Sum(nil)))
 	pb := s.pathToRepo(d, "blob")
 	if m.Digest == "" {
 		m.Digest = d

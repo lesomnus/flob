@@ -1,6 +1,7 @@
 package flob
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,7 +20,8 @@ import (
 // DELETE and ListObjectsV2 (path-style) to exercise the S3 store. It mimics S3's
 // lowercasing of user metadata keys so the round-trip through the real HTTP client
 // is faithful. Signatures are accepted without verification (the SigV4 algorithm
-// is pinned separately by the AWS reference vectors in sigv4_test.go).
+// is pinned separately by the AWS reference vectors in sigv4_test.go). PUT payload
+// hashes are verified against the bytes received, as required by S3.
 type mockS3 struct {
 	bucket string
 
@@ -89,6 +91,10 @@ func (m *mockS3) put(w http.ResponseWriter, r *http.Request, key string) {
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if got, want := r.Header.Get("X-Amz-Content-Sha256"), fmt.Sprintf("%x", sha256.Sum256(data)); got != want {
+		http.Error(w, "XAmzContentSHA256Mismatch", http.StatusBadRequest)
 		return
 	}
 	meta := map[string]string{}
