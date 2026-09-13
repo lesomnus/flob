@@ -39,46 +39,50 @@ func (s CacheStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) 
 	return s.Primary.Add(ctx, m, r)
 }
 
-func (s CacheStore) Get(ctx context.Context, d Digest) (Meta, error) {
-	m, err := s.Primary.Get(ctx, d)
+// Stat reads the primary first, falling back to the origin on failure.
+func (s CacheStore) Stat(ctx context.Context, d Digest) (Info, error) {
+	info, err := s.Primary.Stat(ctx, d)
 	if err == nil {
-		return m, nil
+		return info, nil
 	}
-
-	return s.Origin.Get(ctx, d)
+	return s.Origin.Stat(ctx, d)
 }
 
 // Open reads the blob from the primary store if it exists.
 // Otherwise, it reads from the origin store and caches it in the primary store as it is being read.
 // If the blob read from the origin store is not read to completion or is sought, it may not be cached
 // in the primary store, and the add operation is canceled.
-// Because adding to the primary store happens in a separate goroutine, Get or Open may not be able to
+// Because adding to the primary store happens in a separate goroutine, Stat or Open may not be able to
 // read the blob from the primary store immediately after it has been read from the origin store.
 // This design assumes it is better to return the blob as soon as possible rather than wait for it to be
 // cached in the primary store, since the same blob is unlikely to be requested again very soon after the
 // first access.
-func (s CacheStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
-	r, m, err := s.Primary.Open(ctx, d)
+func (s CacheStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
+	r, info, err := s.Primary.Open(ctx, d)
 	if err == nil {
-		return r, m, nil
+		return r, info, nil
 	}
 
-	r, m, err = s.Origin.Open(ctx, d)
+	r, info, err = s.Origin.Open(ctx, d)
 	if err != nil {
-		return nil, Meta{}, err
+		return nil, nil, err
 	}
 
 	r, sink := newBlobTap(r)
 	go func() {
-		// Ignore error: caching is best-effort.
-		s.Primary.Add(ctx, m, sink)
+		// Labels are needed only for the best-effort cache write. Failure must
+		// not prevent streaming the origin's content.
+		meta, err := infoMeta(ctx, info)
+		if err == nil {
+			s.Primary.Add(ctx, meta, sink)
+		}
 		// Close the read end so that if Add returned without draining the pipe (e.g.
 		// the blob already exists in the primary and Add short-circuits), the pending
 		// blobTap.Read write unblocks with io.ErrClosedPipe instead of hanging forever.
 		sink.Close()
 	}()
 
-	return r, m, nil
+	return r, info, nil
 }
 
 func (s CacheStore) Label(ctx context.Context, d Digest, labels Labels) error {

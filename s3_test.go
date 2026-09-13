@@ -253,7 +253,7 @@ func TestS3Store(t *testing.T) {
 		x.NoError(err)
 		x.Eq(1, mock.countPrefix("refs/"))
 		x.Eq(1, mock.countPrefix("blob/"))
-		_, err = stores.Use("b").Get(ctx, added.Digest)
+		_, err = statMeta(ctx, stores.Use("b"), added.Digest)
 		x.NoError(err)
 
 		// b erases the last reference. The shared blob is intentionally retained
@@ -265,7 +265,7 @@ func TestS3Store(t *testing.T) {
 		x.Eq(0, mock.countPrefix("refs/"))
 		x.Eq(1, mock.countPrefix("blob/")) // retained, not reclaimed
 
-		_, err = stores.Use("b").Get(ctx, added.Digest)
+		_, err = statMeta(ctx, stores.Use("b"), added.Digest)
 		x.ErrorIs(err, ErrNotExist)
 
 		// Re-adding reuses the retained blob and restores visibility.
@@ -337,8 +337,8 @@ func TestS3Store(t *testing.T) {
 
 		for i := 0; i < n; i++ {
 			s := stores.Use(fmt.Sprintf("s-%d", i))
-			if _, err := s.Get(ctx, d); err != nil {
-				t.Fatalf("store %d Get: %v", i, err)
+			if _, err := statMeta(ctx, s, d); err != nil {
+				t.Fatalf("store %d Stat: %v", i, err)
 			}
 			r, _, err := s.Open(ctx, d)
 			if err != nil {
@@ -368,7 +368,7 @@ func TestS3Store(t *testing.T) {
 		x.Eq("3", obj.meta["x-amz-meta-version"])
 		x.Contains(obj.meta, "x-amz-meta-flob-size")
 
-		got, err := stores.Use("t").Get(ctx, added.Digest)
+		got, err := statMeta(ctx, stores.Use("t"), added.Digest)
 		x.NoError(err)
 		x.Eq("application/json", got.Labels.Get("Media-Type"))
 		x.Eq("3", got.Labels.Get("Version"))

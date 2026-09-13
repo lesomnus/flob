@@ -130,11 +130,11 @@ func (t StoreTrace) Erase(ctx context.Context, d flob.Digest) error {
 	return t.Store.Erase(ctx, d)
 }
 
-func (t StoreTrace) Get(ctx context.Context, d flob.Digest) (flob.Meta, error) {
-	ctx, span := otx.TraceStart(ctx, "get")
+func (t StoreTrace) Stat(ctx context.Context, d flob.Digest) (flob.Info, error) {
+	ctx, span := otx.TraceStart(ctx, "stat")
 	defer span.End()
 
-	return t.Store.Get(ctx, d)
+	return t.Store.Stat(ctx, d)
 }
 
 func (t StoreTrace) Label(ctx context.Context, d flob.Digest, labels flob.Labels) error {
@@ -144,7 +144,7 @@ func (t StoreTrace) Label(ctx context.Context, d flob.Digest, labels flob.Labels
 	return t.Store.Label(ctx, d, labels)
 }
 
-func (t StoreTrace) Open(ctx context.Context, d flob.Digest) (io.ReadSeekCloser, flob.Meta, error) {
+func (t StoreTrace) Open(ctx context.Context, d flob.Digest) (io.ReadSeekCloser, flob.Info, error) {
 	ctx, span := otx.TraceStart(ctx, "open")
 	defer span.End()
 
@@ -242,11 +242,11 @@ func (s StoreMeter) Erase(ctx context.Context, d flob.Digest) (err error) {
 	return s.Store.Erase(ctx, d)
 }
 
-func (s StoreMeter) Get(ctx context.Context, d flob.Digest) (v flob.Meta, err error) {
-	done := s.measure(ctx, "get", &err)
+func (s StoreMeter) Stat(ctx context.Context, d flob.Digest) (v flob.Info, err error) {
+	done := s.measure(ctx, "stat", &err)
 	defer done()
 
-	return s.Store.Get(ctx, d)
+	return s.Store.Stat(ctx, d)
 }
 
 func (s StoreMeter) Label(ctx context.Context, d flob.Digest, labels flob.Labels) (err error) {
@@ -256,7 +256,7 @@ func (s StoreMeter) Label(ctx context.Context, d flob.Digest, labels flob.Labels
 	return s.Store.Label(ctx, d, labels)
 }
 
-func (s StoreMeter) Open(ctx context.Context, d flob.Digest) (r io.ReadSeekCloser, v flob.Meta, err error) {
+func (s StoreMeter) Open(ctx context.Context, d flob.Digest) (r io.ReadSeekCloser, v flob.Info, err error) {
 	done := s.measure(ctx, "open", &err)
 	defer done()
 

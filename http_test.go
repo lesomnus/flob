@@ -79,8 +79,10 @@ func TestHttpStore(t *testing.T) {
 		x.NoError(err)
 		r.Close()
 
-		if _, ok := om.Labels["Content-Type"]; ok {
-			t.Fatalf("Open leaked a transport Content-Type as a label: %v", om.Labels)
+		labels, err := om.Labels(ctx)
+		x.NoError(err)
+		if _, ok := labels["Content-Type"]; ok {
+			t.Fatalf("Open leaked a transport Content-Type as a label: %v", labels)
 		}
 	})
 	t.Run("add maps not-found to ErrNotExist", func(t *testing.T) {

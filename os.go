@@ -247,27 +247,25 @@ func (s OsStore) moveStageToRepo(ps, pr string) error {
 	return fmt.Errorf("move from stage to repo after %d attempts: %w", attempts, err)
 }
 
-func (s OsStore) Get(ctx context.Context, d Digest) (m Meta, err error) {
-	_, m, err = s.open(ctx, d)
-	return
+func (s OsStore) Stat(ctx context.Context, d Digest) (Info, error) {
+	_, info, err := s.open(ctx, d)
+	return info, err
 }
 
-func (s OsStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
-	p, m, err := s.open(ctx, d)
+func (s OsStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
+	p, info, err := s.open(ctx, d)
 	if err != nil {
-		return nil, m, err
+		return nil, nil, err
 	}
-
 	f, err := os.Open(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// The file may be removed after the stat.
 			err = ErrNotExist
 		}
-		return nil, m, fmt.Errorf("open blob: %w", err)
+		return nil, info, fmt.Errorf("open blob: %w", err)
 	}
-
-	return f, m, nil
+	return f, info, nil
 }
 
 func (s OsStore) Label(ctx context.Context, d Digest, labels Labels) error {
@@ -278,7 +276,7 @@ func (s OsStore) Label(ctx context.Context, d Digest, labels Labels) error {
 	}
 
 	// Check if the blob exists first to avoid unnecessary work. Existence is defined by the
-	// presence of the `blob` file — the same criterion Get/Open/open use — not by the repo
+	// presence of the `blob` file — the same criterion Stat/Open/open use — not by the repo
 	// directory, so an orphan labels-only directory is treated as "not exist" consistently.
 	p := s.pathToRepo(d, "blob")
 	if _, err := os.Stat(p); err != nil {
@@ -401,46 +399,38 @@ func (s OsStore) tryCleanup(ctx context.Context, d Digest) (bool, error) {
 	return true, nil
 }
 
-func (s OsStore) open(_ context.Context, d Digest) (pb string, m Meta, err error) {
-	if d, err = d.Sanitize(); err != nil {
-		// An invalid digest cannot correspond to any stored blob, and building a path from
-		// it would panic in go-digest, so report it as missing.
-		return "", Meta{}, ErrNotExist
+func (s OsStore) open(_ context.Context, d Digest) (string, Info, error) {
+	d, err := d.Sanitize()
+	if err != nil {
+		return "", nil, ErrNotExist
 	}
-
-	pb = s.pathToRepo(d, "blob")
-	pl := s.pathToRepo(d, "labels")
-
-	info, err := os.Stat(pb)
+	pb := s.pathToRepo(d, "blob")
+	fi, err := os.Stat(pb)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			err = ErrNotExist
-		} else {
-			err = fmt.Errorf("stat: %w", err)
+			return "", nil, ErrNotExist
 		}
-		return
+		return "", nil, fmt.Errorf("stat: %w", err)
 	}
-
-	m.Digest = d
-	m.Size = info.Size()
-
-	var lf *os.File
-	if lf, err = os.Open(pl); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			err = fmt.Errorf("open labels: %w", err)
-			return
+	info := NewInfo(d, fi.Size(), func(ctx context.Context) (Labels, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-	} else {
-		defer lf.Close()
-
-		m.Labels, err = readLabels(lf)
+		lf, err := os.Open(s.pathToRepo(d, "labels"))
 		if err != nil {
-			err = fmt.Errorf("read labels: %w", err)
-			return
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("open labels: %w", err)
 		}
-	}
-
-	return
+		defer lf.Close()
+		labels, err := readLabels(lf)
+		if err != nil {
+			return nil, fmt.Errorf("read labels: %w", err)
+		}
+		return labels, nil
+	})
+	return pb, info, nil
 }
 
 // checkDup checks if the blob with the given path already exists.
