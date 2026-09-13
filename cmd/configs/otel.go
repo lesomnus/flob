@@ -112,6 +112,9 @@ func (t StoresTrace) Use(id string) flob.Store {
 	return StoreTrace{t.Stores.Use(id)}
 }
 
+// Unwrap exposes optional capabilities of the underlying stores.
+func (t StoresTrace) Unwrap() flob.Stores { return t.Stores }
+
 type StoreTrace struct {
 	flob.Store
 }
@@ -222,6 +225,9 @@ func (s StoresMeter) Use(id string) flob.Store {
 		meter: s,
 	}
 }
+
+// Unwrap exposes optional capabilities of the underlying stores.
+func (s StoresMeter) Unwrap() flob.Stores { return s.base }
 
 type StoreMeter struct {
 	flob.Store
