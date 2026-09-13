@@ -120,6 +120,33 @@ Content-Length: 1234
 Foo: bar
 ```
 
+## Streaming client reads
+
+`HttpStore.Open` performs HEAD to capture metadata and returns a lazy
+`io.ReadSeekCloser`. It does not download the blob. Seek only records a position;
+the next Read issues a ranged GET at that position. Reading sequentially consumes
+the response directly, using bounded memory. An empty blob or a size probe needs
+no GET. Close cancels outstanding requests and closes the active response; the
+Open context also controls subsequent reads.
+
+Responses must have identity encoding and a known size from HEAD. Partial
+responses require a valid Content-Range matching the requested start and total
+size, and their body length must match that range. Servers may return a shorter
+partial range; the reader continues with another GET. A server that ignores
+Range can serve sequential reads from offset zero, but nonzero range requests
+fail instead of buffering or downloading an unwanted prefix.
+
+Reopening a response requires the same strong ETag **and exact final resource
+URL**. This prevents seeks from mixing bytes from replaced objects or different
+redirect targets. Without a strong ETag, one sequential response is supported,
+but a seek requiring another GET fails. After the first GET, the client pins its
+exact final URL and sends subsequent range requests directly there with If-Match.
+For presigned redirects, it uses
+the final object's validator instead of sending the flob HEAD digest ETag to S3.
+The signed URL is reused for this reader's lifetime; after it expires, create a
+new Open reader. Redirects from the pinned URL to a different URL are rejected,
+even when only an authentication query changes.
+
 ## Download a Blob
 
 ```
