@@ -31,17 +31,20 @@ import (
 type mockS3 struct {
 	bucket string
 
-	mu      sync.Mutex
-	objects map[string]mockObject // keyed by in-bucket key
+	mu         sync.Mutex
+	objects    map[string]mockObject // keyed by in-bucket key
+	uploads    map[string]*mockMultipart
+	nextUpload int
 }
 
 type mockObject struct {
-	data []byte
-	meta map[string]string // lowercased x-amz-meta-* name -> value
+	data     []byte
+	modified time.Time
+	meta     map[string]string // lowercased x-amz-meta-* name -> value
 }
 
 func newMockS3(bucket string) *mockS3 {
-	return &mockS3{bucket: bucket, objects: map[string]mockObject{}}
+	return &mockS3{bucket: bucket, objects: map[string]mockObject{}, uploads: map[string]*mockMultipart{}}
 }
 
 func (m *mockS3) count() int {
@@ -71,6 +74,10 @@ func (m *mockS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Query().Has("uploads") || r.URL.Query().Has("uploadId") {
+		m.multipart(w, r, key)
+		return
+	}
 	if r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2" {
 		m.list(w, r)
 		return
@@ -85,6 +92,14 @@ func (m *mockS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		m.getOrHead(w, r, key, true)
 	case http.MethodDelete:
 		m.mu.Lock()
+		if match := r.Header.Get("If-Match"); match != "" {
+			obj, ok := m.objects[key]
+			if !ok || match != fmt.Sprintf(`"%x"`, sha256.Sum256(obj.data)) {
+				m.mu.Unlock()
+				http.Error(w, "PreconditionFailed", 412)
+				return
+			}
+		}
 		delete(m.objects, key)
 		m.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
@@ -118,10 +133,18 @@ func (m *mockS3) put(w http.ResponseWriter, r *http.Request, key string) {
 			return
 		}
 	}
-	m.objects[key] = mockObject{data: data, meta: meta}
+	if match := r.Header.Get("If-Match"); match != "" {
+		obj, ok := m.objects[key]
+		if !ok || match != fmt.Sprintf(`"%x"`, sha256.Sum256(obj.data)) {
+			m.mu.Unlock()
+			http.Error(w, "PreconditionFailed", 412)
+			return
+		}
+	}
+	m.objects[key] = mockObject{data: data, meta: meta, modified: time.Now()}
 	m.mu.Unlock()
 
-	w.Header().Set("ETag", `"`+key+`"`)
+	w.Header().Set("ETag", fmt.Sprintf(`"%x"`, sha256.Sum256(data)))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -146,40 +169,46 @@ func (m *mockS3) getOrHead(w http.ResponseWriter, r *http.Request, key string, b
 }
 
 func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
-	prefix := r.URL.Query().Get("prefix")
+	q := r.URL.Query()
+	prefix := q.Get("prefix")
 	maxKeys := 1000
-	if v := r.URL.Query().Get("max-keys"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+	if v := q.Get("max-keys"); v != "" {
+		if n, e := strconv.Atoi(v); e == nil {
 			maxKeys = n
 		}
 	}
-
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	var keys []string
-	for k := range m.objects {
-		if strings.HasPrefix(k, prefix) {
-			keys = append(keys, k)
+	for key := range m.objects {
+		if strings.HasPrefix(key, prefix) && key > q.Get("continuation-token") {
+			keys = append(keys, key)
 		}
 	}
-	m.mu.Unlock()
 	sort.Strings(keys)
+	page := struct {
+		XMLName                             xml.Name `xml:"ListBucketResult"`
+		Name, Prefix                        string
+		KeyCount, MaxKeys                   int
+		IsTruncated                         bool
+		NextContinuationToken, EncodingType string
+		Contents                            []s3StageListedKey
+	}{Name: m.bucket, Prefix: prefix, MaxKeys: maxKeys, EncodingType: q.Get("encoding-type")}
 	if len(keys) > maxKeys {
+		page.IsTruncated = true
 		keys = keys[:maxKeys]
+		page.NextContinuationToken = keys[len(keys)-1]
 	}
-
-	var b strings.Builder
-	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
-	b.WriteString(`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
-	fmt.Fprintf(&b, `<Name>%s</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>%d</MaxKeys><IsTruncated>false</IsTruncated>`,
-		m.bucket, prefix, len(keys), maxKeys)
-	for _, k := range keys {
-		fmt.Fprintf(&b, `<Contents><Key>%s</Key></Contents>`, k)
+	for _, key := range keys {
+		entry := s3StageListedKey{Key: key, LastModified: m.objects[key].modified}
+		if page.EncodingType == "url" {
+			entry.Key = url.PathEscape(key)
+		}
+		page.Contents = append(page.Contents, entry)
 	}
-	b.WriteString(`</ListBucketResult>`)
-
+	page.KeyCount = len(keys)
 	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
-	io.WriteString(w, b.String())
+	xml.NewEncoder(w).Encode(page)
 }
 
 // newMockS3Stores wires an [S3Stores] to a fresh in-memory mock server.
@@ -1051,5 +1080,372 @@ func TestHttpStoreLazyPresignedS3Redirect(t *testing.T) {
 	got, err := io.ReadAll(reader)
 	if err != nil || string(got) != content[7:] {
 		t.Fatalf("redirected seek = %q, %v", got, err)
+	}
+}
+
+type mockMultipart struct {
+	Key       string
+	Initiated time.Time
+	Parts     map[int][]byte
+}
+
+func (m *mockS3) multipart(w http.ResponseWriter, r *http.Request, key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	q := r.URL.Query()
+	id := q.Get("uploadId")
+	if q.Has("uploads") {
+		if r.Method == http.MethodPost {
+			m.nextUpload++
+			id = strconv.Itoa(m.nextUpload)
+			m.uploads[id] = &mockMultipart{Key: key, Initiated: time.Now(), Parts: map[int][]byte{}}
+			fmt.Fprintf(w, "<InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>", id)
+			return
+		}
+		fmt.Fprint(w, "<ListMultipartUploadsResult>")
+		for id, up := range m.uploads {
+			if strings.HasPrefix(up.Key, q.Get("prefix")) {
+				fmt.Fprintf(w, "<Upload><Key>%s</Key><UploadId>%s</UploadId><Initiated>%s</Initiated></Upload>", up.Key, id, up.Initiated.Format(time.RFC3339Nano))
+			}
+		}
+		fmt.Fprint(w, "<IsTruncated>false</IsTruncated></ListMultipartUploadsResult>")
+		return
+	}
+	up, ok := m.uploads[id]
+	if !ok || up.Key != key {
+		http.Error(w, "NoSuchUpload", 404)
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		delete(m.uploads, id)
+		w.WriteHeader(204)
+	case http.MethodPut:
+		source, err := url.PathUnescape(r.Header.Get("X-Amz-Copy-Source"))
+		if err != nil {
+			http.Error(w, "bad copy", 400)
+			return
+		}
+		source = strings.TrimPrefix(source, "/"+m.bucket+"/")
+		obj, ok := m.objects[source]
+		if !ok {
+			http.Error(w, "NoSuchKey", 404)
+			return
+		}
+		number, err := strconv.Atoi(q.Get("partNumber"))
+		if err != nil || number < 1 || number > 10000 {
+			http.Error(w, "bad part", 400)
+			return
+		}
+		up.Parts[number] = append([]byte(nil), obj.data...)
+		fmt.Fprintf(w, `<CopyPartResult><ETag>"%x"</ETag></CopyPartResult>`, sha256.Sum256(obj.data))
+	case http.MethodPost:
+		var complete struct {
+			Parts []struct {
+				Number int `xml:"PartNumber"`
+				ETag   string
+			} `xml:"Part"`
+		}
+		if err := xml.NewDecoder(r.Body).Decode(&complete); err != nil {
+			http.Error(w, "bad complete", 400)
+			return
+		}
+		var data []byte
+		for i, p := range complete.Parts {
+			b, ok := up.Parts[p.Number]
+			if !ok || p.ETag != fmt.Sprintf(`"%x"`, sha256.Sum256(b)) {
+				http.Error(w, "InvalidPart", 400)
+				return
+			}
+			if i < len(complete.Parts)-1 && len(b) < 5<<20 {
+				http.Error(w, "EntityTooSmall", 400)
+				return
+			}
+			data = append(data, b...)
+		}
+		m.objects[key] = mockObject{data: data, meta: map[string]string{}, modified: time.Now()}
+		delete(m.uploads, id)
+		fmt.Fprint(w, "<CompleteMultipartUploadResult/>")
+	default:
+		http.Error(w, "bad method", 405)
+	}
+}
+
+func TestS3StageChunkResumeAndServerCopy(t *testing.T) {
+	g, mock := newMockS3Stores(t)
+	g.stagePartSize = 5 << 20
+	st, err := g.Use("a/b").(*S3Store).Begin(t.Context(), Canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part := bytes.Repeat([]byte("x"), 5<<20)
+	if n, err := st.Append(t.Context(), 0, bytes.NewReader(part[:123])); err != nil || n != 123 {
+		t.Fatalf("append = %d,%v", n, err)
+	}
+	clone := *g
+	resumed, err := clone.Use("a/b").(*S3Store).Resume(t.Context(), st.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := resumed.Append(t.Context(), 123, bytes.NewReader(part)); err != nil || n != int64(len(part)+123) {
+		t.Fatalf("append resumed = %d,%v", n, err)
+	}
+	var gets []string
+	transport := g.cl.Transport
+	g.cl.Transport = rangeRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			gets = append(gets, r.URL.Opaque)
+		}
+		return transport.RoundTrip(r)
+	})
+	result, err := resumed.Commit(t.Context(), Meta{Labels: Labels{"Owner": {"stage"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range gets {
+		if !strings.HasSuffix(path, "/manifest") {
+			t.Fatalf("commit downloaded data: %s", path)
+		}
+	}
+	expected := append(append([]byte(nil), part[:123]...), part...)
+	if result.Digest != DigestFromBytes(expected) || result.Size != int64(len(expected)) {
+		t.Fatalf("result = %#v", result)
+	}
+	mock.mu.Lock()
+	got := append([]byte(nil), mock.objects[g.blobKey(result.Digest)].data...)
+	left := len(mock.uploads)
+	mock.mu.Unlock()
+	if !bytes.Equal(got, expected) || left != 0 {
+		t.Fatalf("assembled len=%d uploads=%d", len(got), left)
+	}
+}
+
+func TestS3StageCommitRecoveryAndPruneMPU(t *testing.T) {
+	g, mock := newMockS3Stores(t)
+	st, err := g.Use("a").(*S3Store).Begin(t.Context(), Canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(t.Context(), 0, strings.NewReader("content")); err != nil {
+		t.Fatal(err)
+	}
+	transport := g.cl.Transport
+	fail := true
+	g.cl.Transport = rangeRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if fail && r.Method == http.MethodPut && strings.Contains(r.URL.Opaque, "/refs/") {
+			fail = false
+			return &http.Response{StatusCode: 503, Status: "503 Service Unavailable", Header: http.Header{}, Body: io.NopCloser(strings.NewReader("injected")), Request: r}, nil
+		}
+		return transport.RoundTrip(r)
+	})
+	wanted := Meta{Labels: Labels{"Owner": {"frozen"}}}
+	if _, err := st.Commit(t.Context(), wanted); err == nil {
+		t.Fatal("injected reference failure ignored")
+	}
+	info, err := st.Stat(t.Context())
+	if err != nil || info.State != StageCommitting {
+		t.Fatalf("pending = %#v,%v", info, err)
+	}
+	if _, err := st.Append(t.Context(), 7, strings.NewReader("bad")); !errors.Is(err, ErrStageClosed) {
+		t.Fatalf("append pending = %v", err)
+	}
+	if _, err := st.Commit(t.Context(), Meta{Labels: Labels{"Owner": {"different"}}}); !errors.Is(err, ErrStageConflict) {
+		t.Fatalf("changed retry = %v", err)
+	}
+	if _, err := g.PruneStages(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := st.Commit(t.Context(), wanted)
+	if err != nil || result.Labels.Get("Owner") != "frozen" {
+		t.Fatalf("recovered = %#v,%v", result, err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	mock.mu.Lock()
+	mock.uploads["abandoned"] = &mockMultipart{Key: g.blobKey(DigestFromBytes([]byte("abandoned"))), Initiated: old}
+	mock.uploads["recent"] = &mockMultipart{Key: g.blobKey(DigestFromBytes([]byte("recent"))), Initiated: time.Now()}
+	mock.mu.Unlock()
+	if _, err := g.PruneStages(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	mock.mu.Lock()
+	_, oldExists := mock.uploads["abandoned"]
+	_, newExists := mock.uploads["recent"]
+	mock.mu.Unlock()
+	if oldExists || !newExists {
+		t.Fatalf("MPU prune old=%v new=%v", oldExists, newExists)
+	}
+}
+
+func TestS3StageLeaseAndFencing(t *testing.T) {
+	g, _ := newMockS3Stores(t)
+	now := time.Now()
+	g.stage.now = func() time.Time { return now }
+	g.stage.OperationTimeout = time.Minute
+	stage, err := g.Use("a").(*S3Store).Begin(t.Context(), Canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := stage.(*s3Stage)
+	old, oldTag, err := st.acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(t.Context(), 0, strings.NewReader("blocked")); !errors.Is(err, ErrStageConflict) {
+		t.Fatalf("lease = %v", err)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := st.Append(t.Context(), 0, strings.NewReader("winner")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.release(t.Context(), old, oldTag); !errors.Is(err, ErrStageConflict) {
+		t.Fatalf("stale writer = %v", err)
+	}
+	result, err := st.Commit(t.Context(), Meta{})
+	if err != nil || result.Digest != DigestFromBytes([]byte("winner")) {
+		t.Fatalf("fenced commit = %#v,%v", result, err)
+	}
+}
+
+type s3StageTruncatedReader struct{ data []byte }
+
+func (r *s3StageTruncatedReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, io.ErrUnexpectedEOF
+}
+func TestS3StageTruncatedAppendIsAtomic(t *testing.T) {
+	for _, size := range []int{123, 5 << 20} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			g, _ := newMockS3Stores(t)
+			g.stagePartSize = 5 << 20
+			st, err := g.Use("a").(*S3Store).Begin(t.Context(), Canonical)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := st.Stat(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.Append(t.Context(), 0, &s3StageTruncatedReader{data: bytes.Repeat([]byte("x"), size)}); !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("truncated input = %v", err)
+			}
+			after, err := st.Stat(t.Context())
+			if err != nil || after.Offset != 0 || !after.ExpiresAt.Equal(before.ExpiresAt) {
+				t.Fatalf("failed append state %#v,%v", after, err)
+			}
+		})
+	}
+}
+
+func TestS3StagePruneProtectsFailedCommittingUpload(t *testing.T) {
+	g, mock := newMockS3Stores(t)
+	st, err := g.Use("a").(*S3Store).Begin(t.Context(), Canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(t.Context(), 0, strings.NewReader("content")); err != nil {
+		t.Fatal(err)
+	}
+	transport := g.cl.Transport
+	g.cl.Transport = rangeRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPut && r.URL.Query().Has("partNumber") {
+			return &http.Response{StatusCode: 503, Status: "503 unavailable", Header: http.Header{}, Body: io.NopCloser(strings.NewReader("injected")), Request: r}, nil
+		}
+		return transport.RoundTrip(r)
+	})
+	if _, err := st.Commit(t.Context(), Meta{}); err == nil {
+		t.Fatal("copy failure ignored")
+	}
+	mock.mu.Lock()
+	for _, upload := range mock.uploads {
+		upload.Initiated = time.Now().Add(-72 * time.Hour)
+	}
+	mock.mu.Unlock()
+	if _, err := g.PruneStages(t.Context()); err == nil {
+		t.Fatal("failed recovery not reported")
+	}
+	mock.mu.Lock()
+	count := len(mock.uploads)
+	mock.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("protected upload count = %d", count)
+	}
+	g.cl.Transport = transport
+	if _, err := st.Commit(t.Context(), Meta{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestS3StagePruneLiveOrphansAndTerminalData(t *testing.T) {
+	g, mock := newMockS3Stores(t)
+	st, err := g.Use("a").(*S3Store).Begin(t.Context(), Canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(t.Context(), 0, strings.NewReader("one")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(t.Context(), 3, strings.NewReader("two")); err != nil {
+		t.Fatal(err)
+	}
+	prefix := st.(*s3Stage).prefix() + "chunks/"
+	mock.mu.Lock()
+	for key, obj := range mock.objects {
+		if strings.HasPrefix(key, prefix) {
+			obj.modified = time.Now().Add(-time.Hour)
+			mock.objects[key] = obj
+		}
+	}
+	mock.mu.Unlock()
+	if n, err := g.PruneStages(t.Context()); err != nil || n != 0 {
+		t.Fatalf("live prune = %d,%v", n, err)
+	}
+	if count := mock.countPrefix(prefix); count != 1 {
+		t.Fatalf("live chunks=%d", count)
+	}
+	if _, err := st.Commit(t.Context(), Meta{}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := g.PruneStages(t.Context()); err != nil || n != 0 {
+		t.Fatalf("terminal prune=%d,%v", n, err)
+	}
+	if count := mock.countPrefix(prefix); count != 0 {
+		t.Fatalf("terminal chunks=%d", count)
+	}
+	if _, err := st.Commit(t.Context(), Meta{}); err != nil {
+		t.Fatalf("receipt retry after cleanup=%v", err)
+	}
+	aborted, err := g.Use("a").(*S3Store).Begin(t.Context(), Canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := aborted.Append(t.Context(), 0, strings.NewReader("abort")); err != nil {
+		t.Fatal(err)
+	}
+	if err := aborted.Abort(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if count := mock.countPrefix(aborted.(*s3Stage).prefix() + "chunks/"); count != 0 {
+		t.Fatalf("aborted chunks=%d", count)
+	}
+}
+
+func TestS3StageReadAndBeginOperationTimeout(t *testing.T) {
+	g, _ := newMockS3Stores(t)
+	store := g.Use("a").(*S3Store)
+	st, err := store.Begin(t.Context(), Canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.stage.OperationTimeout = 20 * time.Millisecond
+	g.cl.Transport = rangeRoundTripper(func(r *http.Request) (*http.Response, error) { <-r.Context().Done(); return nil, r.Context().Err() })
+	if _, err := store.Begin(t.Context(), Canonical); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Begin timeout = %v", err)
+	}
+	if _, err := store.Resume(t.Context(), st.ID()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Resume timeout = %v", err)
+	}
+	if _, err := st.Stat(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stat timeout = %v", err)
 	}
 }

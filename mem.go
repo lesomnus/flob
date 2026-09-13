@@ -3,7 +3,10 @@ package flob
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/opencontainers/go-digest"
 	"io"
 	"iter"
 	"sync"
@@ -18,15 +21,22 @@ var (
 // MemStores is an in-memory [Stores] implementation.
 // All stores share a single global namespace: blobs with the same digest reuse
 // the same underlying [memBlob] and are reference-counted under a mutex, so no
-// GC sweep is ever required.
+// GC sweep is required for committed blobs. Abandoned upload stages must still
+// be pruned with PruneStages.
 type MemStores struct {
-	mu sync.Mutex
-	bs sync.Map // map[Digest]*memBlob
-	ss sync.Map // map[string]*MemStore
+	mu     sync.Mutex
+	bs     sync.Map // map[Digest]*memBlob
+	ss     sync.Map // map[string]*MemStore
+	stages sync.Map // map[string]*memStageEntry
+	stage  StageConfig
 }
 
-func NewMemStores() *MemStores {
-	return &MemStores{}
+func NewMemStores(config ...StageConfig) *MemStores {
+	var cfg StageConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	return &MemStores{stage: cfg.normalized()}
 }
 
 func (s *MemStores) Use(id string) Store {
@@ -69,6 +79,13 @@ func (s *MemStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 		return m, ErrDigestMismatch
 	}
 
+	return s.publish(m, data)
+}
+
+// publish installs already verified immutable bytes and retains Add's duplicate
+// behavior. Staged commits use the same publication path without rehashing.
+func (s *MemStore) publish(m Meta, data []byte) (Meta, error) {
+	d := m.Digest
 	b_new := &memBlob{data: data, refs: 0}
 	b := b_new
 	for {
@@ -321,4 +338,244 @@ func (s *MemStores) Namespaces(ctx context.Context) iter.Seq2[string, error] {
 			return true
 		})
 	}
+}
+
+var _ Stager = (*MemStore)(nil)
+var _ StageCleaner = (*MemStores)(nil)
+
+type memStageEntry struct {
+	lock   chan struct{}
+	record stageRecord
+	data   []byte
+}
+type memStage struct {
+	store *MemStore
+	id    string
+}
+
+func (s *MemStore) Begin(ctx context.Context, algo digest.Algorithm) (Stage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r, err := newStageRecord(s.id, algo, s.g.stage)
+	if err != nil {
+		return nil, err
+	}
+	e := &memStageEntry{lock: make(chan struct{}, 1), record: r}
+	if _, exists := s.g.stages.LoadOrStore(r.ID, e); exists {
+		return nil, ErrStageConflict
+	}
+	return &memStage{store: s, id: r.ID}, nil
+}
+func (s *MemStore) Resume(ctx context.Context, id string) (Stage, error) {
+	h := &memStage{store: s, id: id}
+	if _, err := h.Stat(ctx); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+func (s *memStage) ID() string { return s.id }
+func (s *memStage) acquire(ctx context.Context, allowExpired ...bool) (*memStageEntry, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if !validStageID(s.id) {
+		return nil, nil, ErrNotExist
+	}
+	value, ok := s.store.g.stages.Load(s.id)
+	if !ok {
+		return nil, nil, ErrNotExist
+	}
+	e := value.(*memStageEntry)
+	select {
+	case e.lock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	release := func() { <-e.lock }
+	value, ok = s.store.g.stages.Load(s.id)
+	if !ok || value != e || e.record.Namespace != namespaceSegment(s.store.id) {
+		release()
+		return nil, nil, ErrNotExist
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return nil, nil, err
+	}
+	if err := e.record.validate(); err != nil {
+		release()
+		return nil, nil, err
+	}
+	if e.record.State != StageCommitting && e.record.expired(s.store.g.stage.clock()) && !(len(allowExpired) > 0 && allowExpired[0]) {
+		release()
+		return nil, nil, ErrStageExpired
+	}
+	return e, release, nil
+}
+func (s *memStage) Stat(ctx context.Context) (StageInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.store.g.stage.normalized().OperationTimeout)
+	defer cancel()
+	e, release, err := s.acquire(ctx)
+	if err != nil {
+		return StageInfo{}, err
+	}
+	defer release()
+	return e.record.info(), nil
+}
+func (s *memStage) Append(ctx context.Context, offset int64, r io.Reader) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.store.g.stage.normalized().OperationTimeout)
+	defer cancel()
+	e, release, err := s.acquire(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	current := e.record.Offset
+	if e.record.State != StageActive {
+		return current, ErrStageClosed
+	}
+	if offset != current {
+		return current, ErrOffsetMismatch
+	}
+	hash, err := stageHashRestore(e.record.Algorithm, e.record.Hash)
+	if err != nil {
+		return current, err
+	}
+	var incoming bytes.Buffer
+	if _, err := io.Copy(io.MultiWriter(&incoming, hash), stageContextReader{ctx, r}); err != nil {
+		return current, err
+	}
+	if err := ctx.Err(); err != nil {
+		return current, err
+	}
+	checkpoint, err := stageHashState(hash)
+	if err != nil {
+		return current, err
+	}
+	e.data = append(e.data, incoming.Bytes()...)
+	e.record.Offset = int64(len(e.data))
+	e.record.Hash = checkpoint
+	e.record.ExpiresAt = s.store.g.stage.clock().Add(s.store.g.stage.normalized().TTL)
+	return e.record.Offset, nil
+}
+func (s *memStage) Commit(ctx context.Context, m Meta) (Meta, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.store.g.stage.normalized().OperationTimeout)
+	defer cancel()
+	e, release, err := s.acquire(ctx)
+	if err != nil {
+		return Meta{}, err
+	}
+	defer release()
+	if e.record.State == StageAborted {
+		return Meta{}, ErrStageClosed
+	}
+	prepared, err := e.record.prepareCommit(m)
+	if err != nil {
+		return Meta{}, err
+	}
+	switch e.record.State {
+	case StageCommitted:
+		if !stageCommitMatches(prepared, e.record.Commit) {
+			return Meta{}, ErrStageConflict
+		}
+		return e.record.Result.Clone(), nil
+	case StageCommitting:
+		if !stageCommitMatches(prepared, e.record.Commit) {
+			return Meta{}, ErrStageConflict
+		}
+	case StageActive:
+		e.record.State = StageCommitting
+		e.record.Commit = prepared
+	}
+	return s.complete(ctx, e)
+}
+func (s *memStage) complete(ctx context.Context, e *memStageEntry) (Meta, error) {
+	if err := ctx.Err(); err != nil {
+		return Meta{}, err
+	}
+	result, err := s.store.publish(e.record.Commit, e.data)
+	if errors.Is(err, ErrAlreadyExists) {
+		info, statErr := s.store.Stat(ctx, e.record.Commit.Digest)
+		if statErr != nil {
+			return Meta{}, statErr
+		}
+		result, err = infoMeta(ctx, info)
+	}
+	if err != nil {
+		return Meta{}, err
+	}
+	e.record.Result = result.Clone()
+	e.record.State = StageCommitted
+	e.record.ExpiresAt = s.store.g.stage.clock().Add(s.store.g.stage.normalized().Retention)
+	e.data = nil
+	return result.Clone(), nil
+}
+func (s *memStage) Abort(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, s.store.g.stage.normalized().OperationTimeout)
+	defer cancel()
+	e, release, err := s.acquire(ctx, true)
+	if errors.Is(err, ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer release()
+	switch e.record.State {
+	case StageCommitted, StageAborted:
+		return nil
+	case StageCommitting:
+		_, err := s.complete(ctx, e)
+		return err
+	}
+	e.record.State = StageAborted
+	e.record.ExpiresAt = s.store.g.stage.clock().Add(s.store.g.stage.normalized().Retention)
+	e.data = nil
+	return nil
+}
+func (s *MemStores) PruneStages(ctx context.Context) (int, error) {
+	removed := 0
+	var result error
+	s.stages.Range(func(key, value any) bool {
+		if err := ctx.Err(); err != nil {
+			result = err
+			return false
+		}
+		e := value.(*memStageEntry)
+		select {
+		case e.lock <- struct{}{}:
+		default:
+			return true
+		}
+		defer func() { <-e.lock }()
+		current, ok := s.stages.Load(key)
+		if !ok || current != e {
+			return true
+		}
+		if e.record.State == StageCommitting {
+			namespace, err := namespaceID(e.record.Namespace)
+			if err != nil {
+				result = errors.Join(result, ErrStageFormat)
+				return true
+			}
+			store := s.Use(namespace).(*MemStore)
+			op, cancel := context.WithTimeout(ctx, s.stage.normalized().OperationTimeout)
+			_, err = (&memStage{store: store, id: e.record.ID}).complete(op, e)
+			cancel()
+			if err != nil {
+				result = errors.Join(result, err)
+				return true
+			}
+		}
+		if e.record.expired(s.stage.clock()) {
+			s.stages.Delete(key)
+			e.data = nil
+			removed++
+		}
+		return true
+	})
+	if err := ctx.Err(); err != nil {
+		return removed, errors.Join(result, err)
+	}
+	return removed, result
 }

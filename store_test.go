@@ -6,10 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lesomnus/flob/internal/x"
 	"github.com/opencontainers/go-digest"
@@ -838,5 +842,469 @@ func TestEnumerationDiscovery(t *testing.T) {
 		if got, ok := AsNamespacer(stores); ok || got != nil {
 			t.Fatalf("unexpected Namespacer for %T", stores)
 		}
+	}
+}
+
+func stageContractFactories() map[string]func(*testing.T, StageConfig) Stores {
+	return map[string]func(*testing.T, StageConfig) Stores{
+		"memory": func(t *testing.T, cfg StageConfig) Stores { return NewMemStores(cfg) },
+		"os":     func(t *testing.T, cfg StageConfig) Stores { return NewOsStores(t.TempDir(), cfg) },
+		"s3": func(t *testing.T, cfg StageConfig) Stores {
+			srv := httptest.NewServer(newMockS3("staging-contract"))
+			t.Cleanup(srv.Close)
+			s, err := NewS3Stores(S3Config{Endpoint: srv.URL, Bucket: "staging-contract", Region: "us-east-1", UsePathStyle: true, Credentials: Credentials{AccessKeyID: "key", SecretAccessKey: "secret"}, Client: srv.Client(), Stage: cfg})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		},
+	}
+}
+
+func stageContractBegin(t *testing.T, s Store, algo digest.Algorithm) Stage {
+	t.Helper()
+	stager, ok := AsStager(s)
+	if !ok {
+		t.Fatal("missing Stager")
+	}
+	stage, err := stager.Begin(t.Context(), algo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stage.ID() == "" {
+		t.Fatal("empty stage ID")
+	}
+	return stage
+}
+
+func TestStageContract(t *testing.T) {
+	for backend, factory := range stageContractFactories() {
+		t.Run(backend, func(t *testing.T) {
+			for _, algo := range []digest.Algorithm{"", digest.SHA384, digest.SHA512} {
+				t.Run(string(algo), func(t *testing.T) {
+					stores := factory(t, StageConfig{})
+					s := stores.Use("a/b")
+					stage := stageContractBegin(t, s, algo)
+					effective := algo
+					if effective == "" {
+						effective = Canonical
+					}
+					info, err := stage.Stat(t.Context())
+					if err != nil || info.Algorithm != effective || info.Offset != 0 || info.State != StageActive || info.ExpiresAt.IsZero() {
+						t.Fatalf("initial Stat = %#v, %v", info, err)
+					}
+					const content = "hello world"
+					d := Digest(effective.FromString(content))
+					if offset, err := stage.Append(t.Context(), 0, strings.NewReader("hello ")); err != nil || offset != 6 {
+						t.Fatalf("Append = %d, %v", offset, err)
+					}
+					if _, err := s.Stat(t.Context(), d); !errors.Is(err, ErrNotExist) {
+						t.Fatalf("partial blob visible: %v", err)
+					}
+					stager, _ := AsStager(s)
+					resumed, err := stager.Resume(t.Context(), stage.ID())
+					if err != nil || resumed.ID() != stage.ID() {
+						t.Fatalf("Resume = %v, %v", resumed, err)
+					}
+					if offset, err := resumed.Append(t.Context(), 6, strings.NewReader("world")); err != nil || offset != int64(len(content)) {
+						t.Fatalf("Append resumed = %d, %v", offset, err)
+					}
+					input := Meta{Digest: d, Size: 999, Labels: Labels{"Owner": {"original"}}}
+					got, err := resumed.Commit(t.Context(), input)
+					if err != nil || got.Digest != d || got.Size != int64(len(content)) || got.Labels.Get("Owner") != "original" {
+						t.Fatalf("Commit = %#v, %v", got, err)
+					}
+					got.Labels["Owner"][0] = "mutated receipt"
+					r, _, err := s.Open(t.Context(), d)
+					if err != nil {
+						t.Fatal(err)
+					}
+					data, err := io.ReadAll(r)
+					r.Close()
+					if err != nil || string(data) != content {
+						t.Fatalf("content = %q, %v", data, err)
+					}
+					info, err = stage.Stat(t.Context())
+					if err != nil || info.State != StageCommitted {
+						t.Fatalf("committed Stat = %#v, %v", info, err)
+					}
+					if _, err := stage.Append(t.Context(), int64(len(content)), strings.NewReader("x")); !errors.Is(err, ErrStageClosed) {
+						t.Fatalf("append committed = %v", err)
+					}
+					if _, err := stage.Commit(t.Context(), Meta{Digest: d, Labels: Labels{"Owner": {"changed"}}}); !errors.Is(err, ErrStageConflict) {
+						t.Fatalf("changed commit parameters = %v", err)
+					}
+					if err := stage.Abort(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := s.Stat(t.Context(), d); err != nil {
+						t.Fatalf("Abort deleted committed blob: %v", err)
+					}
+					if err := s.Erase(t.Context(), d); err != nil {
+						t.Fatal(err)
+					}
+					again, err := stage.Commit(t.Context(), input)
+					if err != nil || again.Digest != d || again.Size != int64(len(content)) || again.Labels.Get("Owner") != "original" {
+						t.Fatalf("receipt after erase = %#v, %v", again, err)
+					}
+					if _, err := s.Stat(t.Context(), d); !errors.Is(err, ErrNotExist) {
+						t.Fatalf("receipt republished erased blob: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+type stageContractBrokenReader struct{ sent bool }
+
+func (r *stageContractBrokenReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, "partial"), errors.New("input failed")
+	}
+	return 0, io.EOF
+}
+
+func TestStageAppendAtomicity(t *testing.T) {
+	for backend, factory := range stageContractFactories() {
+		t.Run(backend, func(t *testing.T) {
+			stores := factory(t, StageConfig{})
+			s := stores.Use("a")
+			stage := stageContractBegin(t, s, Canonical)
+			if _, err := stage.Append(t.Context(), 0, strings.NewReader("first")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stage.Append(t.Context(), 5, &stageContractBrokenReader{}); err == nil {
+				t.Fatal("input failure ignored")
+			}
+			info, err := stage.Stat(t.Context())
+			if err != nil || info.Offset != 5 {
+				t.Fatalf("failed append changed offset: %#v, %v", info, err)
+			}
+			untouched := strings.NewReader("not consumed")
+			if _, err := stage.Append(t.Context(), 0, untouched); !errors.Is(err, ErrOffsetMismatch) {
+				t.Fatalf("offset mismatch = %v", err)
+			}
+			if untouched.Len() != len("not consumed") {
+				t.Fatal("offset mismatch consumed input")
+			}
+			if _, err := stage.Append(t.Context(), 5, strings.NewReader("second")); err != nil {
+				t.Fatal(err)
+			}
+			m, err := stage.Commit(t.Context(), Meta{})
+			if err != nil || m.Digest != DigestFromBytes([]byte("firstsecond")) {
+				t.Fatalf("atomic content = %#v, %v", m, err)
+			}
+		})
+	}
+}
+
+func TestStageConcurrentAppend(t *testing.T) {
+	for backend, factory := range stageContractFactories() {
+		t.Run(backend, func(t *testing.T) {
+			stage := stageContractBegin(t, factory(t, StageConfig{}).Use("a"), Canonical)
+			const n = 8
+			results := make(chan error, n)
+			var wg sync.WaitGroup
+			for range n {
+				wg.Go(func() { _, err := stage.Append(t.Context(), 0, strings.NewReader("content")); results <- err })
+			}
+			wg.Wait()
+			close(results)
+			successes := 0
+			for err := range results {
+				if err == nil {
+					successes++
+				} else if !errors.Is(err, ErrOffsetMismatch) && !errors.Is(err, ErrStageConflict) {
+					t.Fatal(err)
+				}
+			}
+			if successes != 1 {
+				t.Fatalf("successful appends = %d", successes)
+			}
+			info, err := stage.Stat(t.Context())
+			if err != nil || info.Offset != 7 {
+				t.Fatalf("concurrent offset = %#v, %v", info, err)
+			}
+		})
+	}
+}
+
+func TestStageNamespaceDuplicateAndAbort(t *testing.T) {
+	for backend, factory := range stageContractFactories() {
+		t.Run(backend, func(t *testing.T) {
+			stores := factory(t, StageConfig{})
+			s := stores.Use("a")
+			existing, err := s.Add(t.Context(), Meta{Labels: Labels{"Owner": {"existing"}}}, strings.NewReader("content"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stage := stageContractBegin(t, s, Canonical)
+			other, _ := AsStager(stores.Use("b"))
+			if _, err := other.Resume(t.Context(), stage.ID()); !errors.Is(err, ErrNotExist) {
+				t.Fatalf("cross namespace Resume = %v", err)
+			}
+			if _, err := stage.Append(t.Context(), 0, strings.NewReader("content")); err != nil {
+				t.Fatal(err)
+			}
+			got, err := stage.Commit(t.Context(), Meta{Labels: Labels{"Owner": {"replacement"}}})
+			if err != nil || got.Digest != existing.Digest || got.Labels.Get("Owner") != "existing" {
+				t.Fatalf("duplicate Commit = %#v, %v", got, err)
+			}
+			info, err := s.Stat(t.Context(), existing.Digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			labels, err := info.Labels(t.Context())
+			if err != nil || labels.Get("Owner") != "existing" {
+				t.Fatalf("existing labels = %v, %v", labels, err)
+			}
+			abandoned := stageContractBegin(t, s, Canonical)
+			if err := abandoned.Abort(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := abandoned.Abort(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			state, err := abandoned.Stat(t.Context())
+			if err != nil || state.State != StageAborted {
+				t.Fatalf("aborted state = %#v, %v", state, err)
+			}
+			if _, err := abandoned.Commit(t.Context(), Meta{}); !errors.Is(err, ErrStageClosed) {
+				t.Fatalf("commit aborted = %v", err)
+			}
+		})
+	}
+}
+
+func TestStageExpiration(t *testing.T) {
+	for backend, factory := range stageContractFactories() {
+		t.Run(backend, func(t *testing.T) {
+			var clock atomic.Int64
+			clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano())
+			cfg := StageConfig{TTL: time.Minute, Retention: time.Minute, OperationTimeout: time.Minute, now: func() time.Time { return time.Unix(0, clock.Load()) }}
+			stores := factory(t, cfg)
+			s := stores.Use("a")
+			stage := stageContractBegin(t, s, Canonical)
+			initial, err := stage.Stat(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			clock.Add(int64(30 * time.Second))
+			stager, _ := AsStager(s)
+			if _, err := stager.Resume(t.Context(), stage.ID()); err != nil {
+				t.Fatal(err)
+			}
+			info, err := stage.Stat(t.Context())
+			if err != nil || !info.ExpiresAt.Equal(initial.ExpiresAt) {
+				t.Fatalf("read renewed TTL: %#v, %v", info, err)
+			}
+			if _, err := stage.Append(t.Context(), 0, &stageContractBrokenReader{}); err == nil {
+				t.Fatal("input failure ignored")
+			}
+			failed, err := stage.Stat(t.Context())
+			if err != nil || !failed.ExpiresAt.Equal(initial.ExpiresAt) {
+				t.Fatalf("failed append renewed TTL: %#v, %v", failed, err)
+			}
+			if _, err := stage.Append(t.Context(), 0, strings.NewReader("content")); err != nil {
+				t.Fatal(err)
+			}
+			info, err = stage.Stat(t.Context())
+			if err != nil || !info.ExpiresAt.After(initial.ExpiresAt) {
+				t.Fatalf("append did not renew TTL: %#v, %v", info, err)
+			}
+			clock.Add(int64(61 * time.Second))
+			if _, err := stage.Stat(t.Context()); !errors.Is(err, ErrStageExpired) {
+				t.Fatalf("expired Stat = %v", err)
+			}
+			if _, err := stager.Resume(t.Context(), stage.ID()); !errors.Is(err, ErrStageExpired) {
+				t.Fatalf("expired Resume = %v", err)
+			}
+			cleaner, ok := AsStageCleaner(stores)
+			if !ok {
+				t.Fatal("missing StageCleaner")
+			}
+			if n, err := cleaner.PruneStages(t.Context()); err != nil || n != 1 {
+				t.Fatalf("Prune = %d, %v", n, err)
+			}
+			if _, err := stager.Resume(t.Context(), stage.ID()); !errors.Is(err, ErrNotExist) {
+				t.Fatalf("pruned Resume = %v", err)
+			}
+			if n, err := cleaner.PruneStages(t.Context()); err != nil || n != 0 {
+				t.Fatalf("second Prune = %d, %v", n, err)
+			}
+			terminal := stageContractBegin(t, s, Canonical)
+			if err := terminal.Abort(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			clock.Add(int64(61 * time.Second))
+			if n, err := cleaner.PruneStages(t.Context()); err != nil || n != 1 {
+				t.Fatalf("terminal Prune = %d, %v", n, err)
+			}
+		})
+	}
+}
+
+func TestStageCancellation(t *testing.T) {
+	for backend, factory := range stageContractFactories() {
+		t.Run(backend, func(t *testing.T) {
+			stores := factory(t, StageConfig{})
+			s := stores.Use("a")
+			stage := stageContractBegin(t, s, Canonical)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			if _, err := stage.Append(ctx, 0, strings.NewReader("content")); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled append = %v", err)
+			}
+			if _, err := stage.Commit(ctx, Meta{}); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled commit = %v", err)
+			}
+			if err := stage.Abort(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled abort = %v", err)
+			}
+			info, err := stage.Stat(t.Context())
+			if err != nil || info.Offset != 0 || info.State != StageActive {
+				t.Fatalf("canceled operation changed stage: %#v, %v", info, err)
+			}
+		})
+	}
+}
+
+func TestStageDiscovery(t *testing.T) {
+	primary, origin := NewMemStores(), NewMemStores()
+	p := primary.Use("a")
+	for _, wrapped := range []Store{AllowDuplicates(CheckExistence(p)), walkStoreWrapper{p}, &CacheStore{Primary: p, Origin: origin.Use("a")}, &FallbackStore{Primary: p, Secondary: origin.Use("a")}} {
+		got, ok := AsStager(wrapped)
+		if !ok || got != p.(Stager) {
+			t.Fatalf("AsStager(%T) = %v, %v", wrapped, got, ok)
+		}
+	}
+	for _, wrapped := range []Stores{walkStoresWrapper{primary}, &CacheStores{Primary: primary, Origin: origin}, &FallbackStores{Primary: primary, Secondary: origin.Use("a")}} {
+		got, ok := AsStageCleaner(wrapped)
+		if !ok || got != primary {
+			t.Fatalf("AsStageCleaner(%T) = %v, %v", wrapped, got, ok)
+		}
+	}
+	for _, s := range []Store{nil, UnimplementedStore{}, HttpStores{}.Use("a")} {
+		if got, ok := AsStager(s); ok || got != nil {
+			t.Fatalf("unexpected Stager for %T", s)
+		}
+	}
+}
+
+func TestStageCommitDigestValidation(t *testing.T) {
+	for backend, factory := range stageContractFactories() {
+		t.Run(backend, func(t *testing.T) {
+			stores := factory(t, StageConfig{})
+			s := stores.Use("a")
+			for _, supplied := range []Digest{DigestFromBytes([]byte("wrong")), Digest(digest.SHA512.FromString("content")), "invalid"} {
+				stage := stageContractBegin(t, s, Canonical)
+				if _, err := stage.Append(t.Context(), 0, strings.NewReader("content")); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := stage.Commit(t.Context(), Meta{Digest: supplied}); err == nil {
+					t.Fatalf("invalid commit accepted %s", supplied)
+				}
+				if _, err := s.Stat(t.Context(), DigestFromBytes([]byte("content"))); !errors.Is(err, ErrNotExist) {
+					t.Fatalf("failed commit published content: %v", err)
+				}
+			}
+			empty := stageContractBegin(t, s, Canonical)
+			got, err := empty.Commit(t.Context(), Meta{})
+			if err != nil || got.Size != 0 || got.Digest != DigestFromBytes(nil) {
+				t.Fatalf("empty commit = %#v, %v", got, err)
+			}
+			stager, _ := AsStager(s)
+			if _, err := stager.Begin(t.Context(), digest.Algorithm("unknown")); err == nil {
+				t.Fatal("unsupported algorithm accepted")
+			}
+		})
+	}
+}
+
+func TestStageRecordValidation(t *testing.T) {
+	for _, algo := range []digest.Algorithm{digest.SHA256, digest.SHA384, digest.SHA512} {
+		t.Run(string(algo), func(t *testing.T) {
+			base, err := newStageRecord("a", algo, StageConfig{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			hash, err := stageHashRestore(algo, base.Hash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hash.Write([]byte("content"))
+			base.Hash, err = stageHashState(hash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			base.Offset = 7
+			prepared, err := base.prepareCommit(Meta{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			base.Commit = prepared
+			base.Result = prepared
+			base.State = StageCommitted
+			if err := base.validate(); err != nil {
+				t.Fatalf("valid record: %v", err)
+			}
+			cases := map[string]func(*stageRecord){
+				"version":           func(r *stageRecord) { r.Version++ },
+				"state":             func(r *stageRecord) { r.State = "invalid" },
+				"id":                func(r *stageRecord) { r.ID = "../invalid" },
+				"offset":            func(r *stageRecord) { r.Offset++ },
+				"truncated hash":    func(r *stageRecord) { r.Hash = r.Hash[:len(r.Hash)-1] },
+				"invalid hash":      func(r *stageRecord) { r.Hash[0] ^= 0xff },
+				"committing digest": func(r *stageRecord) { r.State = StageCommitting; r.Commit.Digest = DigestFromBytes([]byte("wrong")) },
+				"committing size":   func(r *stageRecord) { r.State = StageCommitting; r.Commit.Size++ },
+				"committed digest":  func(r *stageRecord) { r.Result.Digest = DigestFromBytes([]byte("wrong")) },
+				"committed size":    func(r *stageRecord) { r.Result.Size++ },
+			}
+			for name, mutate := range cases {
+				t.Run(name, func(t *testing.T) {
+					record := base
+					record.Hash = append([]byte(nil), base.Hash...)
+					mutate(&record)
+					if err := record.validate(); !errors.Is(err, ErrStageFormat) {
+						t.Fatalf("corrupt record accepted: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestStageNamespaceRoundTrip(t *testing.T) {
+	for backend, factory := range stageContractFactories() {
+		t.Run(backend, func(t *testing.T) {
+			stores := factory(t, StageConfig{})
+			for _, namespace := range []string{"", "a/b", "한글", "\xff", "\xfe", "\ufffd"} {
+				t.Run(fmt.Sprintf("%x", namespace), func(t *testing.T) {
+					s := stores.Use(namespace)
+					stage := stageContractBegin(t, s, Canonical)
+					if _, err := stage.Append(t.Context(), 0, strings.NewReader(namespace)); err != nil {
+						t.Fatal(err)
+					}
+					stager, _ := AsStager(stores.Use(namespace))
+					resumed, err := stager.Resume(t.Context(), stage.ID())
+					if err != nil {
+						t.Fatal(err)
+					}
+					other, _ := AsStager(stores.Use(namespace + "other"))
+					if _, err := other.Resume(t.Context(), stage.ID()); !errors.Is(err, ErrNotExist) {
+						t.Fatalf("cross-namespace Resume = %v", err)
+					}
+					got, err := resumed.Commit(t.Context(), Meta{})
+					if err != nil || got.Digest != Digest(Canonical.FromString(namespace)) {
+						t.Fatalf("Commit = %#v, %v", got, err)
+					}
+					if _, err := s.Stat(t.Context(), got.Digest); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		})
 	}
 }

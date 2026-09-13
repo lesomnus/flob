@@ -283,3 +283,107 @@ On non-Linux platforms the hard-link count is not read (see `nlink.go`), so `Era
 believes it is removing the last reference and deletes the shared `share/` inode eagerly.
 Per-store hard links keep the content fully readable, so this is a *dedup degradation*
 (subsequent adds re-copy the content), never data loss.
+
+## Resumable staged uploads
+
+Memory, OS, and S3 stores implement the optional `Stager` capability. A stage
+belongs to one namespace and stays invisible to `Open`, `Walk`, and `Namespaces`
+until committed. OS and S3 persist stages across process restarts; memory stages
+last only as long as their pool. Existing `Add` behavior is unchanged. HTTP does
+not expose staging endpoints; an application such as a registry maps its upload
+protocol to these Go APIs.
+
+```go
+stores := flob.NewOsStores("./data", flob.StageConfig{
+    TTL:              24 * time.Hour,
+    Retention:        24 * time.Hour,
+    OperationTimeout: 15 * time.Minute,
+})
+store := stores.Use("registry")
+stager, ok := flob.AsStager(store)
+if !ok { return flob.ErrUnimplemented }
+
+stage, err := stager.Begin(ctx, flob.Canonical)
+if err != nil { return err }
+// Persist this ID in the application's upload session before receiving chunks.
+id := stage.ID()
+
+next, err := stage.Append(ctx, 0, firstChunk)
+if err != nil { return err }
+
+// A subsequent request, or a new process using the same pool, resumes by ID.
+stage, err = stager.Resume(ctx, id)
+if err != nil { return err }
+next, err = stage.Append(ctx, next, secondChunk)
+if err != nil { return err }
+result, err := stage.Commit(ctx, flob.Meta{Digest: expectedDigest, Labels: labels})
+if err != nil { return err }
+fmt.Println(result.Digest, result.Size)
+```
+
+`Append` publishes an entire input or none of it. It checks the caller's expected
+offset and returns the new offset, not a byte count. After an uncertain network
+failure, call `stage.Stat(ctx)` to determine the authoritative offset before
+retrying. Concurrent writers are serialized or rejected with `ErrStageConflict`
+/ `ErrOffsetMismatch`; a losing writer may already have consumed input. Separate
+`Resume` handles do not reserve a stage. A handle owns no open connection or file
+and needs no `Close`.
+
+The algorithm is fixed at `Begin` (empty means SHA-256; SHA-384 and SHA-512 are
+also supported). Hash checkpoints and offsets are persisted together so normal
+resume and commit need no complete rehash. A commit with a wrong digest leaves
+the active stage intact. `Meta.Size` is derived from stored bytes, and an empty
+commit digest uses the calculated digest. A validated commit freezes its digest
+and labels; after an interruption, repeat it with the same parameters. Different
+parameters conflict. An already present blob counts as success with its existing
+metadata, without overwriting labels. The recorded result is returned on retries
+even if the blob is subsequently erased. This differs from `Add`, which continues
+to return `ErrAlreadyExists` for duplicates.
+
+### Expiry and maintenance
+
+Nonpositive configuration durations select the defaults shown above. Only a
+successful `Append` refreshes the idle TTL; `Stat` and `Resume` do not. Expired
+stages reject access with `ErrStageExpired`, even before their storage is
+reclaimed. Committed and aborted receipts use the separate retention period.
+After a receipt is pruned, its ID is no longer resumable. `StageInfo.ExpiresAt`
+lets applications report the remaining lifetime.
+
+Use `Abort` to discard an upload. It is idempotent and never removes a published
+blob. A commit that has already frozen its parameters is completed/recovered
+before abort or cleanup can remove temporary data. A storage outage can postpone
+this recovery; a failed cleanup reports the error and can be retried.
+
+```go
+// Invoke periodically from the host's scheduler, using a bounded context.
+if cleaner, ok := flob.AsStageCleaner(stores); ok {
+    removed, err := cleaner.PruneStages(ctx)
+    // Report err and retry on a later maintenance pass.
+    _ = removed
+    _ = err
+}
+```
+
+The library does not start a background sweeper. Run maintenance even when users
+never call `Abort`: clients can disconnect or lose their upload IDs. The return
+count is removed stage records, not bytes or temporary objects. Cleanup can make
+partial progress before returning an error. Active operations are protected;
+OS process locks are released after process death, and S3 leases expire with the
+operation timeout and use conditional updates to reject stale writers. Orphaned
+attempts are reclaimed after a grace period, so physical reclamation need not
+coincide exactly with `ExpiresAt`.
+
+Operation contexts bound storage I/O. As with `Add`, an arbitrary `io.Reader`
+cannot be forcibly interrupted: the host must close or otherwise unblock input
+on cancellation. For network uploads, connect request cancellation to the input
+body's lifetime. A stalled local reader can retain an OS process lock until it
+returns or its process exits.
+
+OS stages use versioned manifests and synced append checkpoints in `uploads/`;
+commit publishes hard links on the same filesystem. S3 uses immutable chunks and
+conditional manifests, and assembles the final object through server-side
+multipart copies without local disk or full-content downloads. See
+[S3 staged uploads](s3.md#staged-uploads) for capabilities, limits, permissions,
+and cleanup requirements. Hash checkpoint format version 1 uses Go's SHA-2
+binary state formats; unsupported or corrupt checkpoints return `ErrStageFormat`
+rather than silently publishing unverified content.

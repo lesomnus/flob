@@ -22,7 +22,9 @@ package flob
 //                   └- labels
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +36,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/opencontainers/go-digest"
 )
 
 var (
@@ -42,12 +45,17 @@ var (
 )
 
 type OsStores struct {
-	root string
-	lock NamedLock
+	root  string
+	lock  NamedLock
+	stage StageConfig
 }
 
-func NewOsStores(root string) OsStores {
-	return OsStores{root, NewOsFileLocker(filepath.Join(root, "locks"))}
+func NewOsStores(root string, stage ...StageConfig) OsStores {
+	var cfg StageConfig
+	if len(stage) > 0 {
+		cfg = stage[0]
+	}
+	return OsStores{root: root, lock: NewOsFileLocker(filepath.Join(root, "locks")), stage: cfg.normalized()}
 }
 
 func (i OsStores) Root() string {
@@ -56,16 +64,20 @@ func (i OsStores) Root() string {
 
 func (i OsStores) Use(id string) Store {
 	return OsStore{
-		root: i.root,
-		repo: filepath.Join(i.root, "repos", namespaceSegment(id)),
-		lock: i.lock,
+		root:      i.root,
+		repo:      filepath.Join(i.root, "repos", namespaceSegment(id)),
+		lock:      i.lock,
+		namespace: id,
+		stage:     i.stage,
 	}
 }
 
 type OsStore struct {
-	root string
-	repo string
-	lock NamedLock
+	root      string
+	repo      string
+	lock      NamedLock
+	namespace string
+	stage     StageConfig
 }
 
 func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
@@ -746,4 +758,843 @@ func (s OsStores) Namespaces(ctx context.Context) iter.Seq2[string, error] {
 			}
 		}
 	}
+}
+
+var (
+	_ Stager       = OsStore{}
+	_ StageCleaner = OsStores{}
+	_ Stage        = (*osStage)(nil)
+)
+
+// Begin creates a durable upload separate from Add's private temporary files.
+// Upload data and SHA-2 checkpoints are synced before publishing each offset.
+func (s OsStore) Begin(ctx context.Context, algo digest.Algorithm) (Stage, error) {
+	cfg := s.stage.normalized()
+	ctx, cancel := context.WithTimeout(ctx, cfg.OperationTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	record, err := newStageRecord(s.namespace, algo, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(s.root, 0o755); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(s.root)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	if err := osStageMkdir(root, "uploads", 0o700); err != nil {
+		return nil, err
+	}
+	path := filepath.Join("uploads", record.ID)
+	if err := root.Mkdir(path, 0o700); err != nil {
+		return nil, err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			root.RemoveAll(path)
+		}
+	}()
+	dir, err := root.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	for _, name := range []string{"lock", "blob"} {
+		f, err := dir.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		err = f.Sync()
+		closeErr := f.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+	}
+	lock := flock.New(filepath.Join(s.root, path, "lock"), flock.SetFlag(os.O_RDWR))
+	if _, err := lock.TryLockContext(ctx, 10*time.Millisecond); err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	if _, err := osStageWriteRecord(ctx, dir, record); err != nil {
+		return nil, err
+	}
+	if err := osStageSyncDir(root, "uploads"); err != nil {
+		return nil, err
+	}
+	keep = true
+	return &osStage{store: s, id: record.ID}, nil
+}
+
+func (s OsStore) Resume(ctx context.Context, id string) (Stage, error) {
+	stage := &osStage{store: s, id: id}
+	locked, err := stage.lock(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	defer locked.close()
+	if err := locked.checkExpiry(); err != nil {
+		return nil, err
+	}
+	if err := locked.recoverTail(); err != nil {
+		return nil, err
+	}
+	return stage, nil
+}
+
+type osStage struct {
+	store OsStore
+	id    string
+}
+
+func (s *osStage) ID() string { return s.id }
+
+type osLockedStage struct {
+	root     *os.Root
+	dir      *os.Root
+	lockFile *flock.Flock
+	record   stageRecord
+	config   StageConfig
+	cancel   context.CancelFunc
+	ctx      context.Context
+}
+
+func (l *osLockedStage) close() { l.lockFile.Close(); l.dir.Close(); l.root.Close(); l.cancel() }
+func (l *osLockedStage) checkExpiry() error {
+	if l.record.State != StageCommitting && l.record.expired(l.config.clock()) {
+		return ErrStageExpired
+	}
+	return nil
+}
+func (s *osStage) lock(ctx context.Context, try bool) (*osLockedStage, error) {
+	return openOsStage(ctx, s.store.root, s.id, &s.store.namespace, s.store.stage, try)
+}
+func openOsStage(ctx context.Context, path, id string, namespace *string, cfg StageConfig, try bool) (*osLockedStage, error) {
+	if !validStageID(id) {
+		return nil, ErrStageFormat
+	}
+	cfg = cfg.normalized()
+	ctx, cancel := context.WithTimeout(ctx, cfg.OperationTimeout)
+	failed := true
+	defer func() {
+		if failed {
+			cancel()
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, osStageError(err)
+	}
+	defer func() {
+		if failed {
+			root.Close()
+		}
+	}()
+	for _, name := range []string{"uploads", filepath.Join("uploads", id)} {
+		info, err := root.Lstat(name)
+		if err != nil {
+			return nil, osStageError(err)
+		}
+		if !info.IsDir() {
+			return nil, ErrStageFormat
+		}
+	}
+	dir, err := root.OpenRoot(filepath.Join("uploads", id))
+	if err != nil {
+		return nil, osStageError(err)
+	}
+	defer func() {
+		if failed {
+			dir.Close()
+		}
+	}()
+	if err := osStageRegular(dir, "lock"); err != nil {
+		return nil, err
+	}
+	lock := flock.New(filepath.Join(path, "uploads", id, "lock"), flock.SetFlag(os.O_RDWR))
+	defer func() {
+		if failed {
+			lock.Close()
+		}
+	}()
+	if try {
+		acquired, err := lock.TryLock()
+		if err != nil {
+			return nil, osStageError(err)
+		}
+		if !acquired {
+			return nil, ErrStageConflict
+		}
+	} else {
+		if _, err := lock.TryLockContext(ctx, 10*time.Millisecond); err != nil {
+			return nil, osStageError(err)
+		}
+	}
+	record, err := osStageReadRecord(dir)
+	if err != nil {
+		return nil, err
+	}
+	if record.ID != id {
+		return nil, ErrStageFormat
+	}
+	if namespace != nil && record.Namespace != namespaceSegment(*namespace) {
+		return nil, ErrNotExist
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	failed = false
+	return &osLockedStage{root: root, dir: dir, lockFile: lock, record: record, config: cfg, cancel: cancel, ctx: ctx}, nil
+}
+func osStageError(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return ErrNotExist
+	}
+	return err
+}
+func osStageRegular(root *os.Root, path string) error {
+	info, err := root.Lstat(path)
+	if err != nil {
+		return osStageError(err)
+	}
+	if !info.Mode().IsRegular() {
+		return ErrStageFormat
+	}
+	return nil
+}
+func osStageReadRecord(dir *os.Root) (stageRecord, error) {
+	if err := osStageRegular(dir, "manifest"); err != nil {
+		return stageRecord{}, err
+	}
+	f, err := dir.Open("manifest")
+	if err != nil {
+		return stageRecord{}, err
+	}
+	defer f.Close()
+	const limit = 16 << 20
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return stageRecord{}, err
+	}
+	if len(data) > limit {
+		return stageRecord{}, ErrStageFormat
+	}
+	var record stageRecord
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&record); err != nil {
+		return stageRecord{}, fmt.Errorf("%w: manifest: %v", ErrStageFormat, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return stageRecord{}, ErrStageFormat
+	}
+	if err := record.validate(); err != nil {
+		return stageRecord{}, err
+	}
+	if record.State == StageCommitting || record.State == StageCommitted {
+		normalized, err := record.prepareCommit(record.Commit)
+		if err != nil || !stageCommitMatches(normalized, record.Commit) {
+			return stageRecord{}, ErrStageFormat
+		}
+	}
+	if record.State == StageCommitted && (record.Result.Digest != record.Commit.Digest || record.Result.Size != record.Offset) {
+		return stageRecord{}, ErrStageFormat
+	}
+	return record, nil
+}
+
+// The bool reports whether rename published the new checkpoint. A subsequent
+// directory-fsync failure has an uncertain outcome and must not roll bytes back
+// underneath a checkpoint that may already be durable.
+func osStageWriteRecord(ctx context.Context, dir *os.Root, record stageRecord) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return false, err
+	}
+	if len(data) > 16<<20 {
+		return false, ErrStageFormat
+	}
+	if err := dir.Remove("manifest.next"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	f, err := dir.OpenFile("manifest.next", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return false, err
+	}
+	defer dir.Remove("manifest.next")
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return false, err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return false, err
+	}
+	if err := f.Close(); err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := dir.Rename("manifest.next", "manifest"); err != nil {
+		return false, err
+	}
+	return true, osStageSyncDir(dir, ".")
+}
+func osStageSyncDir(root *os.Root, path string) error {
+	dir, err := root.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+func osStageMkdir(root *os.Root, path string, mode fs.FileMode) error {
+	current := "."
+	for _, component := range strings.Split(filepath.Clean(path), string(filepath.Separator)) {
+		if component == "." {
+			continue
+		}
+		if component == ".." || component == "" {
+			return ErrStageFormat
+		}
+		parent := current
+		current = filepath.Join(current, component)
+		info, err := root.Lstat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return ErrStageFormat
+			}
+			continue
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		if err := root.Mkdir(current, mode); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		info, err = root.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return ErrStageFormat
+		}
+		if err := osStageSyncDir(root, parent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (l *osLockedStage) recoverTail() error {
+	if err := l.ctx.Err(); err != nil {
+		return err
+	}
+	if l.record.State == StageCommitted || l.record.State == StageAborted {
+		return nil
+	}
+	if err := osStageRegular(l.dir, "blob"); err != nil {
+		return err
+	}
+	f, err := l.dir.OpenFile("blob", os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if l.record.State == StageActive {
+		links, err := nlink(filepath.Join(l.dir.Name(), "blob"))
+		if err != nil {
+			return err
+		}
+		if links != 1 {
+			return ErrStageFormat
+		}
+	}
+	if info.Size() < l.record.Offset {
+		return ErrStageFormat
+	}
+	if info.Size() > l.record.Offset {
+		if err := f.Truncate(l.record.Offset); err != nil {
+			return err
+		}
+		return f.Sync()
+	}
+	return nil
+}
+
+func (s *osStage) Stat(ctx context.Context) (StageInfo, error) {
+	locked, err := s.lock(ctx, false)
+	if err != nil {
+		return StageInfo{}, err
+	}
+	defer locked.close()
+	if err := locked.checkExpiry(); err != nil {
+		return StageInfo{}, err
+	}
+	if err := locked.recoverTail(); err != nil {
+		return StageInfo{}, err
+	}
+	return locked.record.info(), nil
+}
+func (s *osStage) Append(ctx context.Context, expectedOffset int64, r io.Reader) (int64, error) {
+	locked, err := s.lock(ctx, false)
+	if err != nil {
+		return 0, err
+	}
+	defer locked.close()
+	record := locked.record
+	if err := locked.checkExpiry(); err != nil {
+		return record.Offset, err
+	}
+	if record.State != StageActive {
+		return record.Offset, ErrStageClosed
+	}
+	if expectedOffset != record.Offset {
+		return record.Offset, ErrOffsetMismatch
+	}
+	if err := locked.recoverTail(); err != nil {
+		return record.Offset, err
+	}
+	hash, err := stageHashRestore(record.Algorithm, record.Hash)
+	if err != nil {
+		return record.Offset, err
+	}
+	file, err := locked.dir.OpenFile("blob", os.O_RDWR, 0)
+	if err != nil {
+		return record.Offset, err
+	}
+	defer file.Close()
+	if _, err := file.Seek(record.Offset, io.SeekStart); err != nil {
+		return record.Offset, err
+	}
+	rollback := func(err error) (int64, error) {
+		truncateErr := file.Truncate(record.Offset)
+		syncErr := file.Sync()
+		return record.Offset, errors.Join(err, truncateErr, syncErr)
+	}
+	n, err := io.Copy(io.MultiWriter(file, hash), stageContextReader{ctx: locked.ctx, r: r})
+	if err != nil {
+		return rollback(err)
+	}
+	if err := locked.ctx.Err(); err != nil {
+		return rollback(err)
+	}
+	if err := file.Sync(); err != nil {
+		return rollback(err)
+	}
+	next := record
+	next.Offset += n
+	next.ExpiresAt = locked.config.clock().Add(locked.config.TTL)
+	next.Hash, err = stageHashState(hash)
+	if err != nil {
+		return rollback(err)
+	}
+	published, err := osStageWriteRecord(locked.ctx, locked.dir, next)
+	if err != nil && !published {
+		return rollback(err)
+	}
+	return next.Offset, err
+}
+func (s *osStage) Commit(ctx context.Context, m Meta) (Meta, error) {
+	locked, err := s.lock(ctx, false)
+	if err != nil {
+		return Meta{}, err
+	}
+	defer locked.close()
+	if err := locked.checkExpiry(); err != nil {
+		return Meta{}, err
+	}
+	if locked.record.State == StageAborted {
+		return Meta{}, ErrStageClosed
+	}
+	prepared, err := locked.record.prepareCommit(m)
+	if err != nil {
+		return Meta{}, err
+	}
+	if locked.record.State == StageCommitting || locked.record.State == StageCommitted {
+		if !stageCommitMatches(prepared, locked.record.Commit) {
+			return Meta{}, ErrStageConflict
+		}
+		if locked.record.State == StageCommitted {
+			return locked.record.Result.Clone(), nil
+		}
+	} else {
+		if err := locked.recoverTail(); err != nil {
+			return Meta{}, err
+		}
+		locked.record.State = StageCommitting
+		locked.record.Commit = prepared
+		if _, err := osStageWriteRecord(locked.ctx, locked.dir, locked.record); err != nil {
+			return Meta{}, err
+		}
+	}
+	return s.recoverCommit(locked)
+}
+func (s *osStage) recoverCommit(l *osLockedStage) (Meta, error) {
+	if err := l.ctx.Err(); err != nil {
+		return Meta{}, err
+	}
+	if err := l.recoverTail(); err != nil {
+		return Meta{}, err
+	}
+	m := l.record.Commit
+	unlock, err := s.store.lockBlob(l.ctx, m.Digest)
+	if err != nil {
+		return Meta{}, err
+	}
+	defer unlock(context.Background())
+	destination, err := filepath.Rel(s.store.root, s.store.pathToRepo(m.Digest))
+	if err != nil {
+		return Meta{}, err
+	}
+	shared, err := filepath.Rel(s.store.root, s.store.pathToBlob(m.Digest))
+	if err != nil {
+		return Meta{}, err
+	}
+	if err := osStageMkdir(l.root, filepath.Dir(destination), 0o755); err != nil {
+		return Meta{}, err
+	}
+	if info, err := l.root.Lstat(destination); err == nil {
+		if !info.IsDir() {
+			return Meta{}, ErrStageFormat
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return Meta{}, err
+	}
+	if err := osStageRegular(l.root, filepath.Join(destination, "blob")); err == nil {
+		info, err := s.store.Stat(l.ctx, m.Digest)
+		if err != nil {
+			return Meta{}, err
+		}
+		if info.Size() != l.record.Offset {
+			return Meta{}, ErrStageFormat
+		}
+		if err := osStageRegular(l.root, filepath.Join(destination, "labels")); err != nil {
+			return Meta{}, err
+		}
+		m, err = infoMeta(l.ctx, info)
+		if err != nil {
+			return Meta{}, err
+		}
+	} else if !errors.Is(err, ErrNotExist) {
+		return Meta{}, err
+	} else {
+		publish := filepath.Join("uploads", s.id, "publish")
+		if err := l.root.RemoveAll(publish); err != nil {
+			return Meta{}, err
+		}
+		if err := l.root.Mkdir(publish, 0o700); err != nil {
+			return Meta{}, err
+		}
+		defer l.root.RemoveAll(publish)
+		labels, err := l.root.OpenFile(filepath.Join(publish, "labels"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return Meta{}, err
+		}
+		if err := writeLabels(labels, m.Labels); err != nil {
+			labels.Close()
+			return Meta{}, err
+		}
+		if err := labels.Sync(); err != nil {
+			labels.Close()
+			return Meta{}, err
+		}
+		if err := labels.Close(); err != nil {
+			return Meta{}, err
+		}
+		if err := osStageMkdir(l.root, filepath.Dir(shared), 0o755); err != nil {
+			return Meta{}, err
+		}
+		source := filepath.Join("uploads", s.id, "blob")
+		if err := osStageRegular(l.root, shared); err == nil {
+			source = shared
+		} else if !errors.Is(err, ErrNotExist) {
+			return Meta{}, err
+		}
+		if err := l.root.Link(source, filepath.Join(publish, "blob")); err != nil {
+			return Meta{}, err
+		}
+		if source != shared {
+			if err := l.root.Link(source, shared); err != nil {
+				return Meta{}, err
+			}
+			if err := osStageSyncDir(l.root, filepath.Dir(shared)); err != nil {
+				return Meta{}, err
+			}
+		}
+		if err := osStageSyncDir(l.root, publish); err != nil {
+			return Meta{}, err
+		}
+		if err := l.ctx.Err(); err != nil {
+			return Meta{}, err
+		}
+		// Only an orphan digest directory can remain: a valid blob was checked
+		// under the same digest lock used by Add and Link.
+		if info, err := l.root.Lstat(destination); err == nil {
+			if !info.IsDir() {
+				return Meta{}, ErrStageFormat
+			}
+			if err := l.root.RemoveAll(destination); err != nil {
+				return Meta{}, err
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return Meta{}, err
+		}
+		if err := l.root.Rename(publish, destination); err != nil {
+			return Meta{}, err
+		}
+	}
+	for _, name := range []string{"blob", "labels"} {
+		file, err := l.root.Open(filepath.Join(destination, name))
+		if err != nil {
+			return Meta{}, err
+		}
+		err = file.Sync()
+		closeErr := file.Close()
+		if err != nil {
+			return Meta{}, err
+		}
+		if closeErr != nil {
+			return Meta{}, closeErr
+		}
+	}
+	if err := osStageSyncDir(l.root, destination); err != nil {
+		return Meta{}, err
+	}
+	if err := osStageSyncDir(l.root, filepath.Dir(destination)); err != nil {
+		return Meta{}, err
+	}
+	l.record.State = StageCommitted
+	l.record.Result = m.Clone()
+	l.record.ExpiresAt = l.config.clock().Add(l.config.Retention)
+	if _, err := osStageWriteRecord(l.ctx, l.dir, l.record); err != nil {
+		return Meta{}, err
+	}
+	// The receipt, not this private data link, is needed for idempotent retries.
+	if err := l.dir.Remove("blob"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return Meta{}, err
+	}
+	if err := osStageSyncDir(l.dir, "."); err != nil {
+		return Meta{}, err
+	}
+	return m.Clone(), nil
+}
+func (s *osStage) Abort(ctx context.Context) error {
+	locked, err := s.lock(ctx, false)
+	if errors.Is(err, ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer locked.close()
+	if locked.record.State == StageCommitting {
+		_, err := s.recoverCommit(locked)
+		return err
+	}
+	if locked.record.State == StageCommitted || locked.record.State == StageAborted {
+		if err := locked.dir.Remove("blob"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return osStageSyncDir(locked.dir, ".")
+	}
+	locked.record.State = StageAborted
+	locked.record.ExpiresAt = locked.config.clock().Add(locked.config.Retention)
+	if _, err := osStageWriteRecord(locked.ctx, locked.dir, locked.record); err != nil {
+		return err
+	}
+	if err := locked.dir.Remove("blob"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return osStageSyncDir(locked.dir, ".")
+}
+
+// PruneStages skips locked uploads, recovers interrupted commits, and removes
+// expired records and their private files. It never removes published blobs.
+func (s OsStores) PruneStages(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	root, err := os.OpenRoot(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer root.Close()
+	info, err := root.Lstat("uploads")
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() {
+		return 0, ErrStageFormat
+	}
+	dir, err := root.Open("uploads")
+	if err != nil {
+		return 0, err
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	var failures []error
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return removed, errors.Join(append(failures, err)...)
+		}
+		if !validStageID(entry.Name()) {
+			continue
+		}
+		if !entry.IsDir() {
+			failures = append(failures, ErrStageFormat)
+			continue
+		}
+		locked, err := openOsStage(ctx, s.root, entry.Name(), nil, s.stage, true)
+		if errors.Is(err, ErrStageConflict) {
+			continue
+		}
+		if errors.Is(err, ErrNotExist) {
+			pruned, orphanErr := s.pruneOrphanStage(ctx, root, entry.Name())
+			if pruned {
+				removed++
+			}
+			if orphanErr != nil {
+				failures = append(failures, orphanErr)
+			}
+			continue
+		}
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if locked.record.State == StageCommitting {
+			namespace, _ := namespaceID(locked.record.Namespace) // Validated when opening the manifest.
+			stage := &osStage{store: s.Use(namespace).(OsStore), id: entry.Name()}
+			_, err = stage.recoverCommit(locked)
+		}
+		if err == nil && locked.record.expired(locked.config.clock()) {
+			err = root.RemoveAll(filepath.Join("uploads", entry.Name()))
+			if err == nil {
+				removed++
+				err = osStageSyncDir(root, "uploads")
+			}
+		} else if err == nil && locked.record.State != StageCommitting {
+			err = locked.recoverTail()
+			if err == nil {
+				err = locked.dir.RemoveAll("publish")
+			}
+			names := []string{"manifest.next"}
+			if locked.record.State == StageCommitted || locked.record.State == StageAborted {
+				names = append(names, "blob")
+			}
+			for _, name := range names {
+				if err != nil {
+					break
+				}
+				if removeErr := locked.dir.Remove(name); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+					err = removeErr
+				}
+			}
+			if err == nil {
+				err = osStageSyncDir(locked.dir, ".")
+			}
+		}
+		locked.close()
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return removed, errors.Join(failures...)
+}
+
+// A crash before the first manifest leaves no expiry record. Only directories
+// beyond both the idle TTL and maximum operation duration are candidates, and
+// the stage lock plus a second manifest check protect concurrent Begin calls.
+func (s OsStores) pruneOrphanStage(ctx context.Context, root *os.Root, id string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	path := filepath.Join("uploads", id)
+	info, err := root.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, ErrStageFormat
+	}
+	cfg := s.stage.normalized()
+	if cfg.clock().Before(info.ModTime().Add(cfg.TTL).Add(cfg.OperationTimeout)) {
+		return false, nil
+	}
+	dir, err := root.OpenRoot(path)
+	if err != nil {
+		return false, err
+	}
+	defer dir.Close()
+	if _, err := dir.Lstat("manifest"); err == nil {
+		return false, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	if err := osStageRegular(dir, "lock"); errors.Is(err, ErrNotExist) {
+		file, err := dir.OpenFile("lock", os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if errors.Is(err, fs.ErrExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		file.Close()
+	} else if err != nil {
+		return false, err
+	}
+	lock := flock.New(filepath.Join(s.root, path, "lock"), flock.SetFlag(os.O_RDWR))
+	defer lock.Close()
+	acquired, err := lock.TryLock()
+	if err != nil {
+		return false, err
+	}
+	if !acquired {
+		return false, nil
+	}
+	if _, err := dir.Lstat("manifest"); err == nil {
+		return false, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := root.RemoveAll(path); err != nil {
+		return false, err
+	}
+	return true, osStageSyncDir(root, "uploads")
 }

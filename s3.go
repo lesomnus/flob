@@ -17,10 +17,15 @@ package flob
 // Erase removes only the namespace reference.
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"github.com/opencontainers/go-digest"
 	"io"
 	"iter"
 	"net/http"
@@ -47,6 +52,11 @@ const metaPrefix = "X-Amz-Meta-"
 
 // S3Config configures an [S3Stores].
 type S3Config struct {
+	// Stage controls persistent upload expiry, receipt retention, and leases.
+	Stage StageConfig
+	// StagePartSize is the Append buffer/chunk size (default 16MiB; 5MiB–5GiB).
+	// The chosen size is persisted per stage and uploads support at most 10000 parts.
+	StagePartSize int64
 	// Endpoint is the base URL of the S3 service, e.g. "https://s3.us-east-1.amazonaws.com"
 	// or "http://localhost:9000" for MinIO. If empty, it defaults to the AWS
 	// virtual-hosted endpoint derived from Region.
@@ -80,19 +90,27 @@ type S3Config struct {
 
 // S3Stores is a content-addressable [Stores] backed by a single S3 bucket.
 type S3Stores struct {
-	cl        *http.Client
-	signer    signer
-	scheme    string
-	host      string
-	pubScheme string // scheme for presigned (client-facing) URLs
-	pubHost   string // host for presigned (client-facing) URLs
-	bucket    string
-	prefix    string
-	pathStyle bool
+	stage         StageConfig
+	stagePartSize int64
+	cl            *http.Client
+	signer        signer
+	scheme        string
+	host          string
+	pubScheme     string // scheme for presigned (client-facing) URLs
+	pubHost       string // host for presigned (client-facing) URLs
+	bucket        string
+	prefix        string
+	pathStyle     bool
 }
 
 // NewS3Stores builds an [S3Stores] from cfg.
 func NewS3Stores(cfg S3Config) (*S3Stores, error) {
+	if cfg.StagePartSize == 0 {
+		cfg.StagePartSize = 16 << 20
+	}
+	if cfg.StagePartSize < 5<<20 || cfg.StagePartSize > 5<<30 {
+		return nil, fmt.Errorf("S3 stage part size must be between 5MiB and 5GiB")
+	}
 	if cfg.Bucket == "" {
 		return nil, errors.New("s3: bucket is required")
 	}
@@ -133,15 +151,17 @@ func NewS3Stores(cfg S3Config) (*S3Stores, error) {
 	}
 
 	return &S3Stores{
-		cl:        cl,
-		signer:    signer{creds: cfg.Credentials, region: cfg.Region, service: "s3", now: now},
-		scheme:    scheme,
-		host:      host,
-		pubScheme: pubScheme,
-		pubHost:   pubHost,
-		bucket:    cfg.Bucket,
-		prefix:    prefix,
-		pathStyle: cfg.UsePathStyle,
+		stage:         cfg.Stage.normalized(),
+		stagePartSize: cfg.StagePartSize,
+		cl:            cl,
+		signer:        signer{creds: cfg.Credentials, region: cfg.Region, service: "s3", now: now},
+		scheme:        scheme,
+		host:          host,
+		pubScheme:     pubScheme,
+		pubHost:       pubHost,
+		bucket:        cfg.Bucket,
+		prefix:        prefix,
+		pathStyle:     cfg.UsePathStyle,
 	}, nil
 }
 
@@ -791,4 +811,872 @@ func (s *S3Stores) Namespaces(ctx context.Context) iter.Seq2[string, error] {
 			}
 		}
 	}
+}
+
+// S3 stages keep immutable chunks and a conditionally replaced manifest. The
+// manifest ETag is the fencing token; a finite lease bounds abandoned operations.
+const s3StageMaxParts = 10000
+
+type s3StageChunk struct {
+	Key  string
+	Size int64
+}
+type s3StageManifest struct {
+	stageRecord
+	PartSize   int64
+	Chunks     []s3StageChunk
+	Lease      string
+	LeaseUntil time.Time
+	UploadID   string
+}
+type s3Stage struct {
+	store *S3Store
+	id    string
+}
+
+func (s *s3Stage) ID() string { return s.id }
+func (s *s3Stage) prefix() string {
+	return s.store.stores.prefix + "stages/" + namespaceSegment(s.store.id) + "/" + s.id + "/"
+}
+func (s *s3Stage) key() string { return s.prefix() + "manifest" }
+func s3StageNonce() string     { var b [16]byte; rand.Read(b[:]); return fmt.Sprintf("%x", b) }
+func (s *s3Stage) read(ctx context.Context) (*s3StageManifest, string, error) {
+	g := s.store.stores
+	req, err := g.newRequest(ctx, http.MethodGet, s.key(), nil, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	res, err := g.send(req, emptyPayloadHash)
+	if err != nil {
+		return nil, "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == 404 {
+		return nil, "", ErrNotExist
+	}
+	if res.StatusCode != 200 {
+		return nil, "", statusError("read stage", res)
+	}
+	var m s3StageManifest
+	data, err := io.ReadAll(io.LimitReader(res.Body, (16<<20)+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) > 16<<20 {
+		return nil, "", ErrStageFormat
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&m) != nil || decoder.Decode(new(any)) != io.EOF {
+		return nil, "", ErrStageFormat
+	}
+	if m.validate() != nil || m.ID != s.id || m.Namespace != namespaceSegment(s.store.id) {
+		return nil, "", ErrStageFormat
+	}
+	if m.PartSize < 5<<20 || m.PartSize > 5<<30 || len(m.Chunks) > s3StageMaxParts {
+		return nil, "", ErrStageFormat
+	}
+	var total int64
+	for i, c := range m.Chunks {
+		if !strings.HasPrefix(c.Key, s.prefix()+"chunks/") || c.Size <= 0 || c.Size > m.PartSize || (i < len(m.Chunks)-1 && c.Size != m.PartSize) {
+			return nil, "", ErrStageFormat
+		}
+		total += c.Size
+	}
+	if total != m.Offset {
+		return nil, "", ErrStageFormat
+	}
+	etag := strongETag(res.Header.Get("ETag"))
+	if etag == "" {
+		return nil, "", ErrStageFormat
+	}
+	return &m, etag, nil
+}
+func (s *s3Stage) save(ctx context.Context, m *s3StageManifest, etag string) (string, error) {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	g := s.store.stores
+	req, err := g.newRequest(ctx, http.MethodPut, s.key(), nil, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.ContentLength = int64(len(data))
+	if etag == "" {
+		req.Header.Set("If-None-Match", "*")
+	} else {
+		req.Header.Set("If-Match", etag)
+	}
+	res, err := g.send(req, fmt.Sprintf("%x", sha256.Sum256(data)))
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == 409 || res.StatusCode == 412 {
+		return "", ErrStageConflict
+	}
+	if res.StatusCode/100 != 2 {
+		return "", statusError("save stage", res)
+	}
+	next := strongETag(res.Header.Get("ETag"))
+	if next == "" {
+		return "", ErrStageFormat
+	}
+	return next, nil
+}
+func (s *s3Stage) acquire(ctx context.Context) (*s3StageManifest, string, error) {
+	m, etag, err := s.read(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	now := s.store.stores.stage.clock()
+	if m.Lease != "" && now.Before(m.LeaseUntil) {
+		return nil, "", ErrStageConflict
+	}
+	m.Lease = s3StageNonce()
+	m.LeaseUntil = now.Add(s.store.stores.stage.OperationTimeout)
+	etag, err = s.save(ctx, m, etag)
+	return m, etag, err
+}
+func (s *s3Stage) release(ctx context.Context, m *s3StageManifest, etag string) error {
+	m.Lease = ""
+	m.LeaseUntil = time.Time{}
+	_, err := s.save(ctx, m, etag)
+	return err
+}
+func (s *s3Stage) expired(m *s3StageManifest) bool {
+	return !s.store.stores.stage.clock().Before(m.ExpiresAt)
+}
+func (s *S3Store) Begin(ctx context.Context, algo digest.Algorithm) (Stage, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.stores.stage.OperationTimeout)
+	defer cancel()
+	record, err := newStageRecord(s.id, algo, s.stores.stage)
+	if err != nil {
+		return nil, err
+	}
+	st := &s3Stage{store: s, id: record.ID}
+	m := &s3StageManifest{stageRecord: record, PartSize: s.stores.stagePartSize}
+	if _, err := st.save(ctx, m, ""); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+func (s *S3Store) Resume(ctx context.Context, id string) (Stage, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.stores.stage.OperationTimeout)
+	defer cancel()
+	if len(id) != 32 || strings.Trim(id, "0123456789abcdef") != "" {
+		return nil, ErrNotExist
+	}
+	st := &s3Stage{store: s, id: id}
+	m, _, err := st.read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if m.State != StageCommitting && st.expired(m) {
+		return nil, ErrStageExpired
+	}
+	return st, nil
+}
+func (s *s3Stage) Stat(ctx context.Context) (StageInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.store.stores.stage.OperationTimeout)
+	defer cancel()
+	m, _, err := s.read(ctx)
+	if err != nil {
+		return StageInfo{}, err
+	}
+	if m.State != StageCommitting && s.expired(m) {
+		return StageInfo{}, ErrStageExpired
+	}
+	return StageInfo{Algorithm: m.Algorithm, Offset: m.Offset, State: m.State, ExpiresAt: m.ExpiresAt}, nil
+}
+func (s *s3Stage) Append(ctx context.Context, expected int64, r io.Reader) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.store.stores.stage.OperationTimeout)
+	defer cancel()
+	m, etag, err := s.acquire(ctx)
+	if err != nil {
+		return 0, err
+	}
+	released := false
+	defer func() {
+		if !released {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.store.stores.stage.OperationTimeout)
+			defer cancel()
+			s.release(cleanup, m, etag)
+		}
+	}()
+	if m.State != StageActive {
+		return m.Offset, ErrStageClosed
+	}
+	if s.expired(m) {
+		return m.Offset, ErrStageExpired
+	}
+	if m.Offset != expected {
+		return m.Offset, ErrOffsetMismatch
+	}
+	h, err := stageHashRestore(m.Algorithm, m.Hash)
+	if err != nil {
+		return m.Offset, err
+	}
+	chunks := append([]s3StageChunk(nil), m.Chunks...)
+	var tail []byte
+	if len(chunks) > 0 && chunks[len(chunks)-1].Size < m.PartSize {
+		last := chunks[len(chunks)-1]
+		chunks = chunks[:len(chunks)-1]
+		req, e := s.store.stores.newRequest(ctx, http.MethodGet, last.Key, nil, nil)
+		if e != nil {
+			return m.Offset, e
+		}
+		res, e := s.store.stores.send(req, emptyPayloadHash)
+		if e != nil {
+			return m.Offset, e
+		}
+		if res.StatusCode != 200 {
+			e = statusError("read stage tail", res)
+			res.Body.Close()
+			return m.Offset, e
+		}
+		tail, e = io.ReadAll(io.LimitReader(res.Body, m.PartSize))
+		res.Body.Close()
+		if e != nil {
+			return m.Offset, e
+		}
+		if int64(len(tail)) != last.Size {
+			return m.Offset, ErrStageFormat
+		}
+	}
+	source := &s3StageInput{r: stageContextReader{ctx: ctx, r: r}}
+	input := io.MultiReader(bytes.NewReader(tail), io.TeeReader(source, h))
+	written := int64(0)
+	buf := make([]byte, m.PartSize)
+	for {
+		n, e := io.ReadFull(input, buf)
+		if source.err != nil {
+			return m.Offset, source.err
+		}
+		if e != nil && e != io.EOF && e != io.ErrUnexpectedEOF {
+			return m.Offset, e
+		}
+		if err := ctx.Err(); err != nil {
+			return m.Offset, err
+		}
+		if n > 0 {
+			if len(chunks) >= s3StageMaxParts {
+				return m.Offset, fmt.Errorf("S3 stage exceeds %d parts", s3StageMaxParts)
+			}
+			key := s.prefix() + "chunks/" + m.Lease + "/" + strconv.Itoa(len(chunks))
+			req, err := s.store.stores.newRequest(ctx, http.MethodPut, key, nil, bytes.NewReader(buf[:n]))
+			if err != nil {
+				return m.Offset, err
+			}
+			req.ContentLength = int64(n)
+			req.Header.Set("If-None-Match", "*")
+			res, err := s.store.stores.send(req, fmt.Sprintf("%x", sha256.Sum256(buf[:n])))
+			if err != nil {
+				return m.Offset, err
+			}
+			if res.StatusCode/100 != 2 {
+				err = statusError("write stage chunk", res)
+			}
+			res.Body.Close()
+			if err != nil {
+				return m.Offset, err
+			}
+			chunks = append(chunks, s3StageChunk{Key: key, Size: int64(n)})
+			written += int64(n)
+		}
+		if e != nil {
+			break
+		}
+	}
+	checkpoint, err := stageHashState(h)
+	if err != nil {
+		return m.Offset, err
+	}
+	next := *m
+	next.Chunks = chunks
+	next.Offset = m.Offset + written - int64(len(tail))
+	next.Hash = checkpoint
+	next.ExpiresAt = s.store.stores.stage.clock().Add(s.store.stores.stage.TTL)
+	if err := s.release(ctx, &next, etag); err != nil {
+		return m.Offset, err
+	}
+	released = true
+	return next.Offset, nil
+}
+
+func (s *s3Stage) Commit(ctx context.Context, wanted Meta) (Meta, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.store.stores.stage.OperationTimeout)
+	defer cancel()
+	m, etag, err := s.acquire(ctx)
+	if err != nil {
+		return Meta{}, err
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.store.stores.stage.OperationTimeout)
+		defer cancel()
+		s.release(cleanup, m, etag)
+	}()
+	if m.State != StageCommitting && s.expired(m) {
+		return Meta{}, ErrStageExpired
+	}
+	prepared, err := m.prepareCommit(wanted)
+	if err != nil {
+		return Meta{}, err
+	}
+	if m.State == StageCommitted {
+		if !stageCommitMatches(m.Commit, prepared) {
+			return Meta{}, ErrStageConflict
+		}
+		return m.Result.Clone(), nil
+	}
+	if m.State == StageAborted {
+		return Meta{}, ErrStageClosed
+	}
+	if m.State == StageActive {
+		if s.expired(m) {
+			return Meta{}, ErrStageExpired
+		}
+		m.State = StageCommitting
+		m.Commit = prepared
+		etag, err = s.save(ctx, m, etag)
+		if err != nil {
+			return Meta{}, err
+		}
+	} else if m.State != StageCommitting {
+		return Meta{}, ErrStageFormat
+	} else if !stageCommitMatches(m.Commit, prepared) {
+		return Meta{}, ErrStageConflict
+	}
+	result, err := s.publish(ctx, m, &etag)
+	if err != nil {
+		return Meta{}, err
+	}
+	m.State = StageCommitted
+	m.Result = result.Clone()
+	m.ExpiresAt = s.store.stores.stage.clock().Add(s.store.stores.stage.Retention)
+	etag, err = s.save(ctx, m, etag)
+	if err != nil {
+		return Meta{}, err
+	}
+	return result, nil
+}
+func (s *s3Stage) publish(ctx context.Context, m *s3StageManifest, etag *string) (Meta, error) {
+	g := s.store.stores
+	if info, err := s.store.Stat(ctx, m.Commit.Digest); err == nil {
+		return infoMeta(ctx, info)
+	} else if !errors.Is(err, ErrNotExist) {
+		return Meta{}, err
+	}
+	exists, err := g.exists(ctx, g.blobKey(m.Commit.Digest))
+	if err != nil {
+		return Meta{}, err
+	}
+	if !exists {
+		if m.Offset == 0 {
+			if err := g.putBlob(ctx, m.Commit.Digest, bytes.NewReader(nil), 0, emptyPayloadHash); err != nil {
+				return Meta{}, err
+			}
+		} else if err := s.assemble(ctx, m, etag); err != nil {
+			return Meta{}, err
+		}
+	}
+	req, err := g.newRequest(ctx, http.MethodPut, g.refKey(m.Commit.Digest, s.store.id), nil, nil)
+	if err != nil {
+		return Meta{}, err
+	}
+	req.ContentLength = 0
+	req.Header.Set("If-None-Match", "*")
+	setLabelMeta(req.Header, m.Commit.Labels)
+	req.Header.Set(metaPrefix+metaSizeKey, strconv.FormatInt(m.Commit.Size, 10))
+	res, err := g.send(req, emptyPayloadHash)
+	if err != nil {
+		return Meta{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == 412 {
+		info, err := s.store.Stat(ctx, m.Commit.Digest)
+		if err != nil {
+			return Meta{}, err
+		}
+		return infoMeta(ctx, info)
+	}
+	if res.StatusCode/100 != 2 {
+		return Meta{}, statusError("commit stage ref", res)
+	}
+	return m.Commit.Clone(), nil
+}
+func (s *s3Stage) assemble(ctx context.Context, m *s3StageManifest, etag *string) error {
+	g := s.store.stores
+	key := g.blobKey(m.Commit.Digest)
+	if m.UploadID == "" {
+		req, err := g.newRequest(ctx, http.MethodPost, key, url.Values{"uploads": {""}}, nil)
+		if err != nil {
+			return err
+		}
+		res, err := g.send(req, emptyPayloadHash)
+		if err != nil {
+			return err
+		}
+		var created struct {
+			UploadID string `xml:"UploadId"`
+		}
+		if res.StatusCode/100 != 2 {
+			err = statusError("create stage multipart", res)
+		} else {
+			err = xml.NewDecoder(res.Body).Decode(&created)
+		}
+		res.Body.Close()
+		if err != nil {
+			return err
+		}
+		if created.UploadID == "" {
+			return ErrStageFormat
+		}
+		m.UploadID = created.UploadID
+		*etag, err = s.save(ctx, m, *etag)
+		if err != nil {
+			return err
+		}
+	}
+	type part struct {
+		Number int    `xml:"PartNumber"`
+		ETag   string `xml:"ETag"`
+	}
+	completed := struct {
+		XMLName xml.Name `xml:"CompleteMultipartUpload"`
+		Parts   []part   `xml:"Part"`
+	}{}
+	for i, c := range m.Chunks {
+		req, err := g.newRequest(ctx, http.MethodPut, key, url.Values{"uploadId": {m.UploadID}, "partNumber": {strconv.Itoa(i + 1)}}, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("X-Amz-Copy-Source", awsURIEncode("/"+g.bucket+"/"+c.Key, false))
+		res, err := g.send(req, emptyPayloadHash)
+		if err != nil {
+			return err
+		}
+		var copied struct {
+			XMLName xml.Name `xml:"CopyPartResult"`
+			ETag    string
+		}
+		if res.StatusCode == 404 {
+			res.Body.Close()
+			m.UploadID = ""
+			*etag, err = s.save(ctx, m, *etag)
+			if err != nil {
+				return err
+			}
+			return ErrStageConflict
+		}
+		if res.StatusCode/100 != 2 {
+			err = statusError("copy stage part", res)
+		} else {
+			err = xml.NewDecoder(res.Body).Decode(&copied)
+		}
+		res.Body.Close()
+		if err != nil {
+			return err
+		}
+		if copied.ETag == "" {
+			return ErrStageFormat
+		}
+		completed.Parts = append(completed.Parts, part{Number: i + 1, ETag: copied.ETag})
+	}
+	data, err := xml.Marshal(completed)
+	if err != nil {
+		return err
+	}
+	req, err := g.newRequest(ctx, http.MethodPost, key, url.Values{"uploadId": {m.UploadID}}, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = int64(len(data))
+	res, err := g.send(req, fmt.Sprintf("%x", sha256.Sum256(data)))
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode/100 != 2 {
+		return statusError("complete stage multipart", res)
+	}
+	var result struct {
+		XMLName xml.Name `xml:"CompleteMultipartUploadResult"`
+	}
+	if err := xml.NewDecoder(res.Body).Decode(&result); err != nil {
+		return fmt.Errorf("complete stage multipart: %w", err)
+	}
+	return nil
+}
+func (s *s3Stage) Abort(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, s.store.stores.stage.OperationTimeout)
+	defer cancel()
+	defer func() { s.cleanTerminal(ctx) }()
+	m, etag, err := s.acquire(ctx)
+	if err != nil {
+		if errors.Is(err, ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if m.State == StageCommitting {
+		// Publish the frozen operation before reporting closure; never delete an
+		// in-flight commit's chunks or its durable recovery record.
+		result, e := s.publish(ctx, m, &etag)
+		if e != nil {
+			s.release(ctx, m, etag)
+			return e
+		}
+		m.State = StageCommitted
+		m.Result = result
+		m.ExpiresAt = s.store.stores.stage.clock().Add(s.store.stores.stage.Retention)
+		if err := s.release(ctx, m, etag); err != nil {
+			return err
+		}
+		return nil
+	}
+	if m.State == StageCommitted {
+		s.release(ctx, m, etag)
+		return nil
+	}
+	if m.State != StageAborted {
+		m.State = StageAborted
+		m.ExpiresAt = s.store.stores.stage.clock().Add(s.store.stores.stage.Retention)
+	}
+	return s.release(ctx, m, etag)
+}
+
+type s3StageListedKey struct {
+	Key          string
+	LastModified time.Time
+}
+
+func (g *S3Stores) stageKeys(ctx context.Context, only ...string) ([]s3StageListedKey, error) {
+	prefix := g.prefix + "stages/"
+	if len(only) > 0 {
+		prefix = only[0]
+	}
+	var keys []s3StageListedKey
+	token := ""
+	seen := map[string]bool{}
+	for {
+		q := url.Values{"list-type": {"2"}, "prefix": {prefix}, "encoding-type": {"url"}}
+		if token != "" {
+			q.Set("continuation-token", token)
+		}
+		req, err := g.newRequest(ctx, http.MethodGet, "", q, nil)
+		if err != nil {
+			return nil, err
+		}
+		res, err := g.send(req, emptyPayloadHash)
+		if err != nil {
+			return nil, err
+		}
+		var page struct {
+			XMLName                             xml.Name `xml:"ListBucketResult"`
+			Contents                            []s3StageListedKey
+			IsTruncated                         bool
+			NextContinuationToken, EncodingType string
+		}
+		if res.StatusCode != 200 {
+			err = statusError("list stages", res)
+		} else {
+			err = xml.NewDecoder(res.Body).Decode(&page)
+		}
+		res.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range page.Contents {
+			if page.EncodingType == "url" {
+				key.Key, err = url.PathUnescape(key.Key)
+				if err != nil {
+					return nil, err
+				}
+			}
+			keys = append(keys, key)
+		}
+		if !page.IsTruncated {
+			return keys, nil
+		}
+		token = page.NextContinuationToken
+		if token == "" || seen[token] {
+			return nil, ErrStageFormat
+		}
+		seen[token] = true
+	}
+}
+func (g *S3Stores) PruneStages(ctx context.Context) (int, error) {
+	keys, err := g.stageKeys(ctx)
+	if err != nil {
+		return 0, err
+	}
+	groups := map[string][]s3StageListedKey{}
+	stages := map[string]*s3Stage{}
+	records := map[string]*s3StageManifest{}
+	protected := map[string]bool{}
+	for _, key := range keys {
+		rest, ok := strings.CutPrefix(key.Key, g.prefix+"stages/")
+		if !ok {
+			continue
+		}
+		parts := strings.SplitN(rest, "/", 3)
+		if len(parts) != 3 || !validStageID(parts[1]) {
+			continue
+		}
+		id, e := namespaceID(parts[0])
+		if e != nil || namespaceSegment(id) != parts[0] {
+			continue
+		}
+		group := parts[0] + "/" + parts[1]
+		groups[group] = append(groups[group], key)
+		if parts[2] == "manifest" {
+			stages[group] = &s3Stage{store: &S3Store{stores: g, id: id}, id: parts[1]}
+		}
+	}
+	// Finish the inventory before deleting any multipart uploads. Any unreadable
+	// manifest stops pruning because its frozen digest cannot be protected safely.
+	for group, st := range stages {
+		m, _, e := st.read(ctx)
+		if e != nil {
+			if errors.Is(e, ErrNotExist) {
+				continue
+			}
+			return 0, e
+		}
+		records[group] = m
+		if m.State == StageCommitting {
+			protected[g.blobKey(m.Commit.Digest)] = true
+		}
+	}
+	count := 0
+	var failures error
+	for group, m := range records {
+		func() {
+			ctx, cancel := context.WithTimeout(ctx, g.stage.OperationTimeout)
+			defer cancel()
+			st := stages[group]
+			now := g.stage.clock()
+			if m.Lease != "" && now.Before(m.LeaseUntil) {
+				return
+			}
+			if m.State == StageCommitting {
+				if _, e := st.Commit(ctx, m.Commit); e != nil {
+					failures = errors.Join(failures, e)
+					return
+				}
+			}
+			locked, tag, e := st.acquire(ctx)
+			if e != nil {
+				if !errors.Is(e, ErrStageConflict) {
+					failures = errors.Join(failures, e)
+				}
+				return
+			}
+			if locked.State == StageCommitting {
+				protected[g.blobKey(locked.Commit.Digest)] = true
+				st.release(ctx, locked, tag)
+				return
+			}
+			expired := st.expired(locked)
+			e = st.cleanChunks(ctx, locked, groups[group], expired)
+			if e != nil {
+				failures = errors.Join(failures, e)
+				st.release(ctx, locked, tag)
+				return
+			}
+			if !expired {
+				if e = st.release(ctx, locked, tag); e != nil {
+					failures = errors.Join(failures, e)
+				}
+				return
+			}
+			req, x := g.newRequest(ctx, http.MethodDelete, st.key(), nil, nil)
+			if x != nil {
+				e = x
+			} else {
+				req.Header.Set("If-Match", tag)
+				res, x := g.send(req, emptyPayloadHash)
+				if x != nil {
+					e = x
+				} else {
+					if res.StatusCode != 204 && res.StatusCode != 200 && res.StatusCode != 404 {
+						e = statusError("prune stage", res)
+					}
+					res.Body.Close()
+				}
+			}
+			if e != nil {
+				failures = errors.Join(failures, e)
+				st.release(ctx, locked, tag)
+			} else {
+				count++
+			}
+		}()
+	}
+	// Failed/stale appends may have uploaded immutable chunks before losing CAS.
+	// A manifest-less group is reclaimable only after every object has aged past
+	// the TTL and maximum operation duration; fresh in-flight writes remain safe.
+	cutoff := g.stage.clock().Add(-g.stage.TTL - g.stage.OperationTimeout)
+	for group, objects := range groups {
+		if _, ok := stages[group]; ok {
+			continue
+		}
+		old := true
+		for _, obj := range objects {
+			if obj.LastModified.IsZero() || !obj.LastModified.Before(cutoff) {
+				old = false
+			}
+		}
+		if !old {
+			continue
+		}
+		for _, obj := range objects {
+			if e := g.deleteKey(ctx, obj.Key); e != nil {
+				failures = errors.Join(failures, e)
+			}
+		}
+	}
+	if e := g.pruneStageUploads(ctx, protected, cutoff); e != nil {
+		failures = errors.Join(failures, e)
+	}
+	return count, failures
+}
+func (g *S3Stores) pruneStageUploads(ctx context.Context, protected map[string]bool, cutoff time.Time) error {
+	keyMarker, idMarker := "", ""
+	seen := map[string]bool{}
+	for {
+		q := url.Values{"uploads": {""}, "prefix": {g.prefix + "blob/"}, "encoding-type": {"url"}}
+		if keyMarker != "" {
+			q.Set("key-marker", keyMarker)
+		}
+		if idMarker != "" {
+			q.Set("upload-id-marker", idMarker)
+		}
+		req, err := g.newRequest(ctx, http.MethodGet, "", q, nil)
+		if err != nil {
+			return err
+		}
+		res, err := g.send(req, emptyPayloadHash)
+		if err != nil {
+			return err
+		}
+		var page struct {
+			XMLName xml.Name `xml:"ListMultipartUploadsResult"`
+			Upload  []struct {
+				Key       string
+				UploadID  string `xml:"UploadId"`
+				Initiated time.Time
+			}
+			IsTruncated        bool
+			NextKeyMarker      string
+			NextUploadIDMarker string `xml:"NextUploadIdMarker"`
+			EncodingType       string
+		}
+		if res.StatusCode != 200 {
+			err = statusError("list stage multipart uploads", res)
+		} else {
+			err = xml.NewDecoder(res.Body).Decode(&page)
+		}
+		res.Body.Close()
+		if err != nil {
+			return err
+		}
+		for _, up := range page.Upload {
+			if page.EncodingType == "url" {
+				up.Key, err = url.PathUnescape(up.Key)
+				if err != nil {
+					return err
+				}
+			}
+			if !strings.HasPrefix(up.Key, g.prefix+"blob/") || protected[up.Key] || up.Initiated.IsZero() || !up.Initiated.Before(cutoff) {
+				continue
+			}
+			req, err := g.newRequest(ctx, http.MethodDelete, up.Key, url.Values{"uploadId": {up.UploadID}}, nil)
+			if err != nil {
+				return err
+			}
+			res, err := g.send(req, emptyPayloadHash)
+			if err != nil {
+				return err
+			}
+			if res.StatusCode != 204 && res.StatusCode != 404 {
+				err = statusError("abort abandoned stage multipart", res)
+			}
+			res.Body.Close()
+			if err != nil {
+				return err
+			}
+		}
+		if !page.IsTruncated {
+			return nil
+		}
+		keyMarker = page.NextKeyMarker
+		idMarker = page.NextUploadIDMarker
+		if page.EncodingType == "url" {
+			keyMarker, err = url.PathUnescape(keyMarker)
+			if err != nil {
+				return err
+			}
+		}
+		token := keyMarker + "\x00" + idMarker
+		if token == "\x00" || seen[token] {
+			return ErrStageFormat
+		}
+		seen[token] = true
+	}
+}
+
+// Retain source errors even when io.ReadFull fills its buffer and suppresses the
+// accompanying error, or treats a transport's ErrUnexpectedEOF as a short tail.
+type s3StageInput struct {
+	r   io.Reader
+	err error
+}
+
+func (r *s3StageInput) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
+}
+
+// cleanChunks runs under a manifest lease. Active stages retain all currently
+// referenced chunks and any recent attempt data that could still be in flight.
+func (s *s3Stage) cleanChunks(ctx context.Context, m *s3StageManifest, objects []s3StageListedKey, expired bool) error {
+	keep := map[string]bool{}
+	for _, chunk := range m.Chunks {
+		keep[chunk.Key] = true
+	}
+	terminal := m.State == StageCommitted || m.State == StageAborted
+	cutoff := s.store.stores.stage.clock().Add(-s.store.stores.stage.OperationTimeout)
+	for _, obj := range objects {
+		if !strings.HasPrefix(obj.Key, s.prefix()+"chunks/") {
+			continue
+		}
+		if !terminal && !expired && (keep[obj.Key] || obj.LastModified.IsZero() || !obj.LastModified.Before(cutoff)) {
+			continue
+		}
+		if err := s.store.stores.deleteKey(ctx, obj.Key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *s3Stage) cleanTerminal(ctx context.Context) {
+	m, tag, err := s.acquire(ctx)
+	if err != nil {
+		return
+	}
+	defer s.release(ctx, m, tag)
+	if m.State != StageCommitted && m.State != StageAborted {
+		return
+	}
+	keys, err := s.store.stores.stageKeys(ctx, s.prefix())
+	if err != nil {
+		return
+	}
+	s.cleanChunks(ctx, m, keys, false)
 }
