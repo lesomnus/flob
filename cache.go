@@ -32,6 +32,9 @@ type CacheStore struct {
 	Origin  Store
 }
 
+// Unwrap exposes the primary store's optional capabilities.
+func (s CacheStore) Unwrap() Store { return s.Primary }
+
 func (s CacheStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return s.Primary.Add(ctx, m, r)
 }

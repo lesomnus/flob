@@ -95,6 +95,9 @@ type FallbackStore struct {
 	Secondary Store
 }
 
+// Unwrap exposes the primary store's optional capabilities.
+func (s FallbackStore) Unwrap() Store { return s.Primary }
+
 func (s FallbackStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return s.Primary.Add(ctx, m, r)
 }
