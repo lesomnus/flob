@@ -86,7 +86,7 @@ func TestPrepareDigest(t *testing.T) {
 }
 
 func TestFallbackStore(t *testing.T) {
-	t.Run("get and open fall back to secondary", func(t *testing.T) {
+	t.Run("stat and open fall back to secondary", func(t *testing.T) {
 		ctx, x := x.New(t)
 
 		primary := NewMemStores()
@@ -98,7 +98,7 @@ func TestFallbackStore(t *testing.T) {
 		x.NoError(err)
 
 		s := stores.Use("repo")
-		got, err := s.Get(ctx, m.Digest)
+		got, err := statMeta(ctx, s, m.Digest)
 		x.NoError(err)
 		x.Eq(m.Digest, got.Digest)
 
@@ -120,10 +120,10 @@ func TestFallbackStore(t *testing.T) {
 		m, err := s.Add(ctx, Meta{}, x.Reader())
 		x.NoError(err)
 
-		_, err = primary.Use("repo").Get(ctx, m.Digest)
+		_, err = statMeta(ctx, primary.Use("repo"), m.Digest)
 		x.NoError(err)
 
-		_, err = secondary.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, secondary, m.Digest)
 		x.ErrorIs(err, ErrNotExist)
 	})
 }

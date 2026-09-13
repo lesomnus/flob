@@ -16,7 +16,7 @@ import (
 //
 //	  POST /{store-id}          - [Store.Add]
 //	  POST /{store-id}/{digest} - [Store.Add] with pre-computed digest
-//	  HEAD /{store-id}/{digest} - [Store.Get]
+//	  HEAD /{store-id}/{digest} - [Store.Stat]
 //	   GET /{store-id}/{digest} - [Store.Open]
 //	 PATCH /{store-id}/{digest} - [Store.Label]
 //	DELETE /{store-id}/{digest} - [Store.Erase]
@@ -95,7 +95,7 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 
 	case http.MethodHead:
-		m, err := store.Get(r.Context(), d)
+		info, err := store.Stat(r.Context(), d)
 		if err != nil {
 			switch {
 			case errors.Is(err, ErrNotExist):
@@ -103,6 +103,11 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			default:
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 			}
+			return
+		}
+		m, err := infoMeta(r.Context(), info)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		h.setMetaHeaders(w, m)
@@ -134,7 +139,7 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		rc, m, err := store.Open(r.Context(), d)
+		rc, info, err := store.Open(r.Context(), d)
 		if err != nil {
 			switch {
 			case errors.Is(err, ErrNotExist):
@@ -145,6 +150,11 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer rc.Close()
+		m, err := infoMeta(r.Context(), info)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		h.setMetaHeaders(w, m)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		http.ServeContent(w, r, "", time.Time{}, rc)
@@ -275,43 +285,44 @@ func (s HttpStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return m, err
 }
 
-func (s HttpStore) Get(ctx context.Context, d Digest) (Meta, error) {
+func (s HttpStore) Stat(ctx context.Context, d Digest) (Info, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.url(d), nil)
 	if err != nil {
-		return Meta{}, err
+		return nil, err
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return Meta{}, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if err := s.parseErr(resp); err != nil {
-		return Meta{}, err
+		return nil, err
 	}
-	return s.parseMeta(resp), nil
+	m := s.parseMeta(resp)
+	return NewInfo(m.Digest, m.Size, func(context.Context) (Labels, error) { return m.Labels, nil }), nil
 }
 
 // Open downloads the blob content into memory to satisfy [io.ReadSeekCloser].
-func (s HttpStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
+func (s HttpStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url(d), nil)
 	if err != nil {
-		return nil, Meta{}, err
+		return nil, nil, err
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, Meta{}, err
+		return nil, nil, err
 	}
 	if err := s.parseErr(resp); err != nil {
 		resp.Body.Close()
-		return nil, Meta{}, err
+		return nil, nil, err
 	}
 	m := s.parseMeta(resp)
 	data, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		return nil, Meta{}, err
+		return nil, nil, err
 	}
-	return nopCloser{bytes.NewReader(data)}, m, nil
+	return nopCloser{bytes.NewReader(data)}, NewInfo(m.Digest, m.Size, func(context.Context) (Labels, error) { return m.Labels, nil }), nil
 }
 
 func (s HttpStore) Label(ctx context.Context, d Digest, labels Labels) error {

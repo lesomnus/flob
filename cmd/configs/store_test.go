@@ -12,7 +12,7 @@ import (
 	"github.com/lesomnus/flob"
 )
 
-// echoBucket is a stand-in S3 endpoint: it answers HEAD with 404 so a Get returns
+// echoBucket is a stand-in S3 endpoint: it answers HEAD with 404 so Stat returns
 // ErrNotExist, which is enough to prove the config produced a working, signed
 // client pointed at the right place.
 func TestStoresConfigS3(t *testing.T) {
@@ -49,9 +49,9 @@ s3/main:
 	}
 
 	d := flob.Digest("sha256:0000000000000000000000000000000000000000000000000000000000000000")
-	_, err = stores.Use("store-1").Get(context.Background(), d)
+	_, err = stores.Use("store-1").Stat(context.Background(), d)
 	if err == nil || !strings.Contains(err.Error(), "not exist") {
-		t.Fatalf("get err = %v", err)
+		t.Fatalf("stat err = %v", err)
 	}
 
 	if !strings.Contains(gotPath, "/my-bucket/tenant-a/refs/") {

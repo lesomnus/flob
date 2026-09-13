@@ -37,7 +37,7 @@ func TestMemStore(t *testing.T) {
 
 		// After every store erased its reference, nothing sees the blob.
 		for i := range n {
-			_, err := stores.Use(fmt.Sprintf("s-%d", i)).Get(ctx, d)
+			_, err := statMeta(ctx, stores.Use(fmt.Sprintf("s-%d", i)), d)
 			x.ErrorIs(err, ErrNotExist)
 		}
 

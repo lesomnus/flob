@@ -96,11 +96,11 @@ func TestOsStore(t *testing.T) {
 		x.Eq(n, 2)
 
 		// s1 must no longer see the blob.
-		_, err = s1.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, s1, m.Digest)
 		x.ErrorIs(err, ErrNotExist)
 
 		// s2 must still see the blob.
-		_, err = s2.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, s2, m.Digest)
 		x.NoError(err)
 	})
 	t.Run("all refs erased removes global blob", func(t *testing.T) {
@@ -135,7 +135,7 @@ func TestOsStore(t *testing.T) {
 		// path, so the store must reject it defensively instead.
 		bad := Digest("deadbeef")
 
-		_, err := s.Get(ctx, bad)
+		_, err := statMeta(ctx, s, bad)
 		x.ErrorIs(err, ErrNotExist)
 
 		_, _, err = s.Open(ctx, bad)
@@ -176,7 +176,7 @@ func TestOsStore(t *testing.T) {
 		x.Eq(x.Data(), got)
 	})
 
-	t.Run("label existence check matches get and open", func(t *testing.T) {
+	t.Run("label existence check matches stat and open", func(t *testing.T) {
 		ctx, x := x.New(t)
 		root := t.TempDir()
 		s := NewOsStores(root).Use("test").(OsStore)
@@ -184,13 +184,13 @@ func TestOsStore(t *testing.T) {
 		d := DigestFromBytes(x.Data())
 
 		// An orphan repo directory that has a labels file but no blob (e.g. a crash mid-Erase).
-		// Get/Open define existence by the blob file, so they report ErrNotExist; Label must
+		// Stat/Open define existence by the blob file, so they report ErrNotExist; Label must
 		// use the same criterion instead of merely checking that the directory exists.
 		pr := s.pathToRepo(d)
 		x.NoError(os.MkdirAll(pr, 0o755))
 		x.NoError(os.WriteFile(filepath.Join(pr, "labels"), []byte("X-Foo: bar\r\n\r\n"), 0o644))
 
-		_, err := s.Get(ctx, d)
+		_, err := statMeta(ctx, s, d)
 		x.ErrorIs(err, ErrNotExist)
 
 		_, _, err = s.Open(ctx, d)
@@ -310,7 +310,7 @@ func TestOsStoreAddWithoutASystemTempDir(t *testing.T) {
 		t.Fatalf("size: got %d want %d", m.Size, len(data))
 	}
 
-	if _, err := s.Get(t.Context(), m.Digest); err != nil {
-		t.Fatalf("get: %v", err)
+	if _, err := statMeta(t.Context(), s, m.Digest); err != nil {
+		t.Fatalf("stat: %v", err)
 	}
 }

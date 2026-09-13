@@ -21,12 +21,13 @@ type Store interface {
 	// It may block until the blob is fully read from r even if the context is canceled, so it is caller's
 	// responsibility to close r when the context is canceled.
 	Add(ctx context.Context, m Meta, r io.Reader) (Meta, error)
-	// Get retrieves the [Meta] of the blob with the given digest.
+	// Stat checks existence and retrieves blob information without requiring label access.
+	// It returns [ErrNotExist] if the blob does not exist in this store.
+	Stat(ctx context.Context, d Digest) (Info, error)
+	// Open opens the blob with the given digest for reading without loading labels.
+	// Labels can be requested separately through the returned [Info].
 	// It returns [ErrNotExist] if the blob does not exist.
-	Get(ctx context.Context, d Digest) (Meta, error)
-	// Open opens the blob with the given digest for reading.
-	// It returns [ErrNotExist] if the blob does not exist.
-	Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error)
+	Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error)
 	// Label updates the labels of the blob with the given digest.
 	// It returns [ErrNotExist] if the blob does not exist.
 	Label(ctx context.Context, d Digest, labels Labels) error

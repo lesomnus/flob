@@ -2,6 +2,7 @@ package flob
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"testing"
 
@@ -22,7 +23,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		return stores.Use("test")
 	}
 
-	t.Run("add then get", func(t *testing.T) {
+	t.Run("add then stat", func(t *testing.T) {
 		ctx, x := x.New(t)
 		s := new_store(t)
 
@@ -34,7 +35,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		x.Len(added.Labels["Foo"], 1)
 		x.Eq("bar", added.Labels["Foo"][0])
 
-		got, err := s.Get(ctx, added.Digest)
+		got, err := statMeta(ctx, s, added.Digest)
 		x.NoError(err)
 		x.Eq(added.Digest, got.Digest)
 		x.Contains(got.Labels, "Foo")
@@ -109,11 +110,11 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		x.ErrorIs(err, ErrAlreadyExists)
 		x.Eq(m.Digest, got.Digest)
 	})
-	t.Run("get missing returns ErrNotExist", func(t *testing.T) {
+	t.Run("stat missing returns ErrNotExist", func(t *testing.T) {
 		ctx, x := x.New(t)
 		s := new_store(t)
 
-		_, err := s.Get(ctx, digest_nil)
+		_, err := statMeta(ctx, s, digest_nil)
 		x.ErrorIs(err, ErrNotExist)
 	})
 	t.Run("add with matching digest succeeds", func(t *testing.T) {
@@ -124,7 +125,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		x.NoError(err)
 		x.Eq(x.Digest(), string(added.Digest))
 
-		got, err := s.Get(ctx, added.Digest)
+		got, err := statMeta(ctx, s, added.Digest)
 		x.NoError(err)
 		x.Eq(added.Digest, got.Digest)
 	})
@@ -137,7 +138,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		x.ErrorIs(err, ErrDigestMismatch)
 
 		// The failed Add must not have stored anything.
-		_, err = s.Get(ctx, Digest(x.Digest()))
+		_, err = statMeta(ctx, s, Digest(x.Digest()))
 		x.ErrorIs(err, ErrNotExist)
 	})
 	t.Run("add pre-supplied digest of existing returns ErrAlreadyExists", func(t *testing.T) {
@@ -176,7 +177,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		err = s.Erase(ctx, m.Digest)
 		x.NoError(err)
 
-		_, err = s.Get(ctx, m.Digest)
+		_, err = statMeta(ctx, s, m.Digest)
 		x.ErrorIs(err, ErrNotExist)
 
 		// Re-adding the same content after erase must succeed, not fail with a leftover.
@@ -184,7 +185,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		x.NoError(err)
 		x.Eq(m.Digest, m2.Digest)
 
-		got, err := s.Get(ctx, m2.Digest)
+		got, err := statMeta(ctx, s, m2.Digest)
 		x.NoError(err)
 		x.Eq(m.Digest, got.Digest)
 	})
@@ -199,7 +200,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		r, gm, err := s.Open(ctx, m.Digest)
 		x.NoError(err)
 		defer r.Close()
-		x.Eq(int64(0), gm.Size)
+		x.Eq(int64(0), gm.Size())
 
 		got, err := io.ReadAll(r)
 		x.NoError(err)
@@ -213,13 +214,13 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		x.NoError(err)
 
 		// Mutating a returned label must not leak into the store's own copy.
-		got, err := s.Get(ctx, added.Digest)
+		got, err := statMeta(ctx, s, added.Digest)
 		x.NoError(err)
 		if vs := got.Labels["Media-Type"]; len(vs) > 0 {
 			vs[0] = "MUTATED"
 		}
 
-		again, err := s.Get(ctx, added.Digest)
+		again, err := statMeta(ctx, s, added.Digest)
 		x.NoError(err)
 		x.Eq("text/plain", again.Labels.Get("Media-Type"))
 	})
@@ -246,7 +247,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		added, err := s.Add(ctx, Meta{Labels: labels_init}, x.Reader())
 		x.NoError(err)
 
-		got, err := s.Get(ctx, added.Digest)
+		got, err := statMeta(ctx, s, added.Digest)
 		x.NoError(err)
 		x.Eq(labels_init.Get("Media-Type"), got.Labels.Get("Media-Type"))
 		x.Eq(labels_init.Get("Version"), got.Labels.Get("Version"))
@@ -255,7 +256,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		err = s.Label(ctx, added.Digest, labels_new)
 		x.NoError(err)
 
-		got, err = s.Get(ctx, added.Digest)
+		got, err = statMeta(ctx, s, added.Digest)
 		x.NoError(err)
 		x.Eq(labels_new.Get("Media-Type"), got.Labels.Get("Media-Type"))
 		x.Eq(labels_new.Get("Version"), got.Labels.Get("Version"))
@@ -276,7 +277,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		err := s.Erase(ctx, digest_nil)
 		x.NoError(err)
 	})
-	t.Run("get across stores returns ErrNotExist", func(t *testing.T) {
+	t.Run("stat across stores returns ErrNotExist", func(t *testing.T) {
 		ctx, x := x.New(t)
 
 		stores := new_stores(t)
@@ -286,7 +287,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		added, err := s1.Add(ctx, Meta{}, x.Reader())
 		x.NoError(err)
 
-		_, err = s2.Get(ctx, added.Digest)
+		_, err = statMeta(ctx, s2, added.Digest)
 		x.ErrorIs(err, ErrNotExist)
 	})
 	t.Run("open across stores returns ErrNotExist", func(t *testing.T) {
@@ -328,7 +329,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		err = s2.Erase(ctx, added.Digest)
 		x.NoError(err)
 
-		_, err = s1.Get(ctx, added.Digest)
+		_, err = statMeta(ctx, s1, added.Digest)
 		x.NoError(err)
 	})
 	t.Run("duplicate check is scoped to each store", func(t *testing.T) {
@@ -369,9 +370,9 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		err = s2.Label(ctx, m2.Digest, labels_b)
 		x.NoError(err)
 
-		got_a, err := s1.Get(ctx, m1.Digest)
+		got_a, err := statMeta(ctx, s1, m1.Digest)
 		x.NoError(err)
-		got_b, err := s2.Get(ctx, m2.Digest)
+		got_b, err := statMeta(ctx, s2, m2.Digest)
 		x.NoError(err)
 
 		x.Eq(labels_a.Get("Media-Type"), got_a.Labels.Get("Media-Type"))
@@ -379,4 +380,13 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		x.Eq(labels_b.Get("Media-Type"), got_b.Labels.Get("Media-Type"))
 		x.Eq(labels_b.Get("Repo"), got_b.Labels.Get("Repo"))
 	})
+}
+
+// statMeta materializes labels for tests that exercise complete metadata.
+func statMeta(ctx context.Context, s Store, d Digest) (Meta, error) {
+	info, err := s.Stat(ctx, d)
+	if err != nil {
+		return Meta{}, err
+	}
+	return infoMeta(ctx, info)
 }
