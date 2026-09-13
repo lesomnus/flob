@@ -145,6 +145,36 @@ HTTP clients to use the encoded segment; `HttpStores` handles it automatically.
 Back up legacy layouts before migration, since old traversal IDs may have written
 outside `repos/` or the store root.
 
+## Enumeration
+
+Memory, OS, and S3 backends expose optional `Walker` and `Namespacer`
+capabilities. `Walk(ctx)` yields `Info` and errors; `Namespaces(ctx)` yields IDs
+of namespaces containing at least one valid blob reference. Calling `Use` alone
+or erasing the last blob does not leave an enumerable namespace.
+
+```go
+if walker, ok := flob.AsWalker(store); ok {
+    for info, err := range walker.Walk(ctx) {
+        if err != nil { return err }
+        fmt.Println(info.Digest(), info.Size())
+        // info.Labels(ctx) loads labels only if needed.
+    }
+}
+if namespaces, ok := flob.AsNamespacer(stores); ok {
+    for id, err := range namespaces.Namespaces(ctx) {
+        if err != nil { return err }
+        fmt.Println(id)
+    }
+}
+```
+
+These are physical inventories with no ordering or snapshot guarantee during
+concurrent writes. Invalid layout entries are skipped. A failure yields one
+terminal error; cancellation stops work and reports the context error. Breaking
+the loop stops further I/O. `AsWalker` and `AsNamespacer` follow decorator
+`Unwrap` methods; cache and fallback inventories describe their primary storage,
+not a union with the origin or secondary. HTTP does not expose enumeration.
+
 ## Blob information and lazy labels
 
 `Store.Stat` checks existence and returns an `Info` with the blob's digest and

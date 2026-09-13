@@ -83,6 +83,9 @@ type FallbackStores struct {
 	Secondary Store
 }
 
+// Unwrap exposes the primary pool's optional inventory capabilities.
+func (s FallbackStores) Unwrap() Stores { return s.Primary }
+
 func (s FallbackStores) Use(id string) Store {
 	return FallbackStore{
 		Primary:   s.Primary.Use(id),
