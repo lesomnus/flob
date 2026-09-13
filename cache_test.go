@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/lesomnus/flob/internal/x"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +13,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/lesomnus/flob/internal/x"
 )
 
 // nonDrainingStores is a primary that never holds the blob (Open/Stat always miss) and whose
@@ -176,66 +177,78 @@ func waitCacheWrite(t *testing.T, done <-chan error) error {
 }
 
 func TestCacheServeContent(t *testing.T) {
-	for _, mode := range []string{"sniff", "content-type", "handler", "range"} {
-		t.Run(mode, func(t *testing.T) {
-			content := []byte(strings.Repeat("blob content\n", 10000))
-			origin := NewMemStores().Use("t")
-			meta, err := origin.Add(t.Context(), Meta{}, bytes.NewReader(content))
-			if err != nil {
-				t.Fatal(err)
-			}
-			primary := completedCacheStore{Store: NewMemStores().Use("t"), done: make(chan error, 1), started: make(chan struct{})}
-			store := &CacheStore{Primary: primary, Origin: origin}
-			response := httptest.NewRecorder()
-			request := httptest.NewRequest(http.MethodGet, "/t/"+string(meta.Digest), nil)
-			if mode == "handler" {
-				HttpHandler{Stores: FixedStores{Store: store}}.ServeHTTP(response, request)
-			} else {
-				r, _, err := store.Open(t.Context(), meta.Digest)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if mode == "content-type" || mode == "range" {
-					response.Header().Set("Content-Type", "application/octet-stream")
-				}
-				if mode == "range" {
-					// Ensure this case observes an aborted Add, rather than
-					// cancellation before the best-effort writer starts.
-					<-primary.started
-					request.Header.Set("Range", "bytes=1000-1999")
-				}
-				http.ServeContent(response, request, "", time.Time{}, r)
-				if err := r.Close(); err != nil {
-					t.Fatal(err)
-				}
-			}
-			writeErr := waitCacheWrite(t, primary.done)
-			if mode == "range" {
-				if response.Code != http.StatusPartialContent || !bytes.Equal(response.Body.Bytes(), content[1000:2000]) {
-					t.Fatalf("range response = %d, %d bytes", response.Code, response.Body.Len())
-				}
-				if writeErr == nil {
-					t.Fatal("partial range was cached")
-				}
-				if _, err := primary.Stat(t.Context(), meta.Digest); !errors.Is(err, ErrNotExist) {
-					t.Fatalf("partial cache Stat = %v", err)
-				}
-				return
-			}
-			if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), content) {
-				t.Fatalf("response = %d, %d bytes", response.Code, response.Body.Len())
-			}
-			if writeErr != nil {
-				t.Fatal(writeErr)
-			}
-			r, _, err := primary.Open(t.Context(), meta.Digest)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer r.Close()
-			cached, err := io.ReadAll(r)
-			if err != nil || !bytes.Equal(cached, content) {
-				t.Fatalf("cached bytes differ: %v", err)
+	for name, factory := range map[string]func(*testing.T) Store{
+		"memory": func(t *testing.T) Store { return NewMemStores().Use("t") },
+		"http": func(t *testing.T) Store {
+			stores, _ := newHttpStores(t, NewMemStores())
+			return stores.Use("t")
+		},
+		"s3": func(t *testing.T) Store {
+			stores, _ := newMockS3Stores(t)
+			return stores.Use("t")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, mode := range []string{"sniff", "content-type", "handler", "range"} {
+				t.Run(mode, func(t *testing.T) {
+					content := []byte(strings.Repeat("blob content\n", 10000))
+					origin := factory(t)
+					meta, err := origin.Add(t.Context(), Meta{}, bytes.NewReader(content))
+					if err != nil {
+						t.Fatal(err)
+					}
+					primary := completedCacheStore{Store: NewMemStores().Use("t"), done: make(chan error, 1), started: make(chan struct{})}
+					store := &CacheStore{Primary: primary, Origin: origin}
+					response := httptest.NewRecorder()
+					request := httptest.NewRequest(http.MethodGet, "/t/"+string(meta.Digest), nil)
+					if mode == "handler" {
+						HttpHandler{Stores: FixedStores{Store: store}}.ServeHTTP(response, request)
+					} else {
+						r, _, err := store.Open(t.Context(), meta.Digest)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if mode == "content-type" || mode == "range" {
+							response.Header().Set("Content-Type", "application/octet-stream")
+						}
+						if mode == "range" {
+							<-primary.started
+							request.Header.Set("Range", "bytes=1000-1999")
+						}
+						http.ServeContent(response, request, "", time.Time{}, r)
+						if err := r.Close(); err != nil {
+							t.Fatal(err)
+						}
+					}
+					writeErr := waitCacheWrite(t, primary.done)
+					if mode == "range" {
+						if response.Code != http.StatusPartialContent || !bytes.Equal(response.Body.Bytes(), content[1000:2000]) {
+							t.Fatalf("range response = %d, %d bytes", response.Code, response.Body.Len())
+						}
+						if writeErr == nil {
+							t.Fatal("partial range was cached")
+						}
+						if _, err := primary.Stat(t.Context(), meta.Digest); !errors.Is(err, ErrNotExist) {
+							t.Fatalf("partial cache Stat = %v", err)
+						}
+						return
+					}
+					if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), content) {
+						t.Fatalf("response = %d, %d bytes", response.Code, response.Body.Len())
+					}
+					if writeErr != nil {
+						t.Fatal(writeErr)
+					}
+					r, _, err := primary.Open(t.Context(), meta.Digest)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer r.Close()
+					cached, err := io.ReadAll(r)
+					if err != nil || !bytes.Equal(cached, content) {
+						t.Fatalf("cached bytes differ: %v", err)
+					}
+				})
 			}
 		})
 	}
