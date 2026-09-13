@@ -54,7 +54,7 @@ func (i OsStores) Root() string {
 func (i OsStores) Use(id string) Store {
 	return OsStore{
 		root: i.root,
-		repo: filepath.Join(i.root, "repos", id),
+		repo: filepath.Join(i.root, "repos", namespaceSegment(id)),
 		lock: i.lock,
 	}
 }

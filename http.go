@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -40,7 +41,7 @@ type HttpHandler struct {
 const DefaultRedirectTTL = 15 * time.Minute
 
 func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	id, digest_raw, ok := h.parsePath(r.URL.Path)
+	id, digest_raw, ok := h.parsePath(r.URL.EscapedPath())
 	if !ok {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -87,7 +88,7 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.setMetaHeaders(w, m)
-		w.Header().Set("Location", "/"+id+"/"+string(m.Digest))
+		w.Header().Set("Location", "/"+namespaceSegment(id)+"/"+string(m.Digest))
 		// This response carries no body, so the blob size set by setMetaHeaders
 		// must not be advertised as its length or strict clients (and reverse
 		// proxies) wait for bytes that never come.
@@ -184,21 +185,29 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// parsePath splits /{store-id} or /{store-id}/{digest} from the request path.
+// parsePath splits /{store-id} or /{store-id}/{digest} from the escaped request
+// path, URL-unescapes each segment once, and decodes the namespace ID.
 // Any deeper path returns ok=false.
 func (h *HttpHandler) parsePath(path string) (storeID, digest string, ok bool) {
 	parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 3)
-	switch len(parts) {
-	case 1:
-		if parts[0] == "" {
-			return "", "", false
-		}
-		return parts[0], "", true
-	case 2:
-		return parts[0], parts[1], true
-	default:
+	if len(parts) > 2 || parts[0] == "" {
 		return "", "", false
 	}
+	segment, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return "", "", false
+	}
+	storeID, err = namespaceID(segment)
+	if err != nil {
+		return "", "", false
+	}
+	if len(parts) == 2 {
+		digest, err = url.PathUnescape(parts[1])
+		if err != nil {
+			return "", "", false
+		}
+	}
+	return storeID, digest, true
 }
 
 // parseLabels extracts headers with the "Flob-" prefix from r, strips the prefix,
@@ -237,7 +246,7 @@ func (s HttpStores) Use(id string) Store {
 	return HttpStore{
 		client: client,
 		base:   strings.TrimRight(s.Target, "/"),
-		id:     id,
+		id:     namespaceSegment(id),
 	}
 }
 
