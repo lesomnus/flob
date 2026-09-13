@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/lesomnus/flob/internal/x"
+	"github.com/opencontainers/go-digest"
 )
 
 var digest_nil = Digest("sha256:0000000000000000000000000000000000000000000000000000000000000000")
@@ -40,6 +41,63 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		x.Len(got.Labels["Foo"], 1)
 		x.Eq("bar", got.Labels["Foo"][0])
 	})
+	for _, algo := range []digest.Algorithm{digest.SHA384, digest.SHA512} {
+		t.Run(string(algo)+" lifecycle", func(t *testing.T) {
+			ctx, x := x.New(t)
+			s := new_store(t)
+			d := Digest(algo.FromBytes(x.Data()))
+			m, err := s.Add(ctx, Meta{Digest: d, Labels: Labels{"Foo": {"bar"}}}, x.Reader())
+			x.NoError(err)
+			x.Eq(d, m.Digest)
+			got, err := s.Get(ctx, d)
+			x.NoError(err)
+			x.Eq(d, got.Digest)
+			x.Eq(int64(len(x.Data())), got.Size)
+			x.Eq(m.Labels, got.Labels)
+			r, got, err := s.Open(ctx, d)
+			x.NoError(err)
+			defer r.Close()
+			data, err := io.ReadAll(r)
+			x.NoError(err)
+			x.Eq(x.Data(), data)
+			x.Eq(d, got.Digest)
+			_, err = s.Add(ctx, Meta{Digest: d}, x.Reader())
+			x.ErrorIs(err, ErrAlreadyExists)
+			x.NoError(s.Label(ctx, d, Labels{"Foo": {"updated"}}))
+			got, err = s.Get(ctx, d)
+			x.NoError(err)
+			x.Eq(Labels{"Foo": {"updated"}}, got.Labels)
+			canonical, err := s.Add(ctx, Meta{}, x.Reader())
+			x.NoError(err)
+			x.Eq(DigestFromBytes(x.Data()), canonical.Digest)
+			x.NoError(s.Erase(ctx, d))
+			_, err = s.Get(ctx, d)
+			x.ErrorIs(err, ErrNotExist)
+			_, err = s.Get(ctx, canonical.Digest)
+			x.NoError(err)
+		})
+		t.Run(string(algo)+" mismatch", func(t *testing.T) {
+			ctx, x := x.New(t)
+			s := new_store(t)
+			d := Digest(algo.FromBytes([]byte("different content")))
+			_, err := s.Add(ctx, Meta{Digest: d}, x.Reader())
+			x.ErrorIs(err, ErrDigestMismatch)
+			_, err = s.Get(ctx, d)
+			x.ErrorIs(err, ErrNotExist)
+			_, err = s.Get(ctx, Digest(algo.FromBytes(x.Data())))
+			x.ErrorIs(err, ErrNotExist)
+		})
+	}
+	t.Run("invalid digest returns an error", func(t *testing.T) {
+		ctx, x := x.New(t)
+		s := new_store(t)
+		for _, d := range []Digest{"unknown:abcd", "sha512:abcd", "malformed"} {
+			if _, err := s.Add(ctx, Meta{Digest: d}, x.Reader()); err == nil {
+				t.Errorf("Add with invalid digest %q succeeded", d)
+			}
+		}
+	})
+
 	t.Run("add duplicate returns digest and ErrAlreadyExists", func(t *testing.T) {
 		ctx, x := x.New(t)
 		s := new_store(t)

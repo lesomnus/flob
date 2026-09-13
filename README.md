@@ -1,7 +1,8 @@
 # flob
 
 A content-addressable storage (CAS) backed purely by the filesystem — no database required.
-Blobs are identified by their SHA-256 digest and organized under isolated 1-depth namespaced stores.
+Blobs are identified by their digest and organized under isolated 1-depth namespaced stores.
+`Add` uses SHA-256 by default, or the algorithm of a supplied `Meta.Digest` (SHA-256, SHA-384, or SHA-512).
 
 ## Usage
 
@@ -47,7 +48,7 @@ semantics (cross-store dedup, per-store visibility):
 - **`MemStores`** — in-memory, for tests and caches.
 - **`HttpStores`** / `HttpHandler` — client/server over HTTP (see [`http.md`](./http.md)).
 - **`S3Stores`** — any S3-compatible bucket (AWS S3, MinIO) over plain HTTP with no
-  AWS SDK dependency; blobs are deduplicated by SHA-256 key and stores are isolated
+  AWS SDK dependency; blobs are deduplicated by digest key and stores are isolated
   by per-store reference markers (see [`s3.md`](./s3.md)).
 
 ## Design & Consistency

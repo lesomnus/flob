@@ -1,6 +1,8 @@
 package flob
 
 import (
+	_ "crypto/sha256" // Register the algorithms supported by go-digest.
+	_ "crypto/sha512"
 	"hash"
 	"io"
 	"strings"

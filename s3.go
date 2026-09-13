@@ -248,15 +248,14 @@ func (s *S3Stores) exists(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
-// putBlob uploads the shared blob. payloadHash is the blob's hex digest, which is
-// exactly its SHA-256, so no re-hash is needed for signing.
-func (s *S3Stores) putBlob(ctx context.Context, d Digest, body io.Reader, size int64) error {
+// putBlob uploads the shared blob using its SHA-256 payload hash for signing.
+func (s *S3Stores) putBlob(ctx context.Context, d Digest, body io.Reader, size int64, payloadHash string) error {
 	req, err := s.newRequest(ctx, http.MethodPut, s.blobKey(d), nil, body)
 	if err != nil {
 		return err
 	}
 	req.ContentLength = size
-	res, err := s.send(req, d.Encoded())
+	res, err := s.send(req, payloadHash)
 	if err != nil {
 		return err
 	}
@@ -318,12 +317,14 @@ type S3Store struct {
 func (s *S3Store) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	g := s.stores
 
+	algo := Canonical
 	if m.Digest != "" {
 		d, err := m.Digest.Sanitize()
 		if err != nil {
 			return m, err
 		}
 		m.Digest = d
+		algo = d.Algorithm()
 
 		// Duplicate check is scoped to this store: only its reference counts.
 		if ok, err := g.exists(ctx, g.refKey(d, s.id)); err != nil {
@@ -333,8 +334,8 @@ func (s *S3Store) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 		}
 	}
 
-	// Buffer to a temp file while hashing so the digest is known before upload
-	// and can be reused as the blob's payload hash for signing.
+	// Buffer to a temp file while computing the blob digest and the SHA-256
+	// payload hash required for signing.
 	tf, err := os.CreateTemp("", "flob-s3-*")
 	if err != nil {
 		return m, fmt.Errorf("create temp: %w", err)
@@ -343,14 +344,20 @@ func (s *S3Store) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	defer os.Remove(tp)
 	defer tf.Close()
 
-	h := Canonical.Hash()
-	n, err := io.Copy(io.MultiWriter(tf, h), r)
+	h := algo.Hash()
+	payloadHash := h
+	w := io.MultiWriter(tf, h)
+	if algo != Canonical {
+		payloadHash = Canonical.Hash()
+		w = io.MultiWriter(tf, h, payloadHash)
+	}
+	n, err := io.Copy(w, r)
 	if err != nil {
 		return m, fmt.Errorf("buffer blob: %w", err)
 	}
 	m.Size = n
 
-	d := Digest(fmt.Sprintf("sha256:%x", h.Sum(nil)))
+	d := Digest(fmt.Sprintf("%s:%x", algo, h.Sum(nil)))
 	if m.Digest == "" {
 		m.Digest = d
 		if ok, err := g.exists(ctx, g.refKey(d, s.id)); err != nil {
@@ -370,7 +377,7 @@ func (s *S3Store) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 		if _, err := tf.Seek(0, io.SeekStart); err != nil {
 			return m, fmt.Errorf("seek temp: %w", err)
 		}
-		if err := g.putBlob(ctx, d, tf, n); err != nil {
+		if err := g.putBlob(ctx, d, tf, n, fmt.Sprintf("%x", payloadHash.Sum(nil))); err != nil {
 			return m, err
 		}
 	}
