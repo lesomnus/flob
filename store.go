@@ -20,52 +20,19 @@ type Store interface {
 	// It may block until the blob is fully read from r even if the context is canceled, so it is caller's
 	// responsibility to close r when the context is canceled.
 	Add(ctx context.Context, m Meta, r io.Reader) (Meta, error)
-	// Get retrieves the [Meta] of the blob with the given digest.
+	// Stat checks existence and retrieves blob information without requiring label access.
+	// It returns [ErrNotExist] if the blob does not exist in this store.
+	Stat(ctx context.Context, d Digest) (Info, error)
+	// Open opens the blob with the given digest for reading without loading labels.
+	// Labels can be requested separately through the returned [Info].
 	// It returns [ErrNotExist] if the blob does not exist.
-	Get(ctx context.Context, d Digest) (Meta, error)
-	// Open opens the blob with the given digest for reading.
-	// It returns [ErrNotExist] if the blob does not exist.
-	Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error)
+	Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error)
 	// Label updates the labels of the blob with the given digest.
 	// It returns [ErrNotExist] if the blob does not exist.
 	Label(ctx context.Context, d Digest, labels Labels) error
 	// Erase removes the blob with the given digest from the store.
 	// It does not return [ErrNotExist] even if the blob does not exist.
 	Erase(ctx context.Context, d Digest) error
-}
-
-// Stater is an optional capability for checking a blob's existence and size
-// without retrieving its labels. Callers can use [AsStater] to discover it,
-// falling back to [Store.Get] when unavailable.
-type Stater interface {
-	// Stat returns the blob's size in bytes, or [ErrNotExist] if it does not
-	// exist in this store. Blobs in other stores are not visible.
-	Stat(ctx context.Context, d Digest) (size int64, err error)
-}
-
-// AsStater returns the first [Stater] in s's decorator chain, following
-// Unwrap() Store methods, or false if none is found. Decorators that change
-// read semantics must implement Stat themselves to preserve those semantics.
-func AsStater(s Store) (Stater, bool) {
-	for s != nil {
-		if st, ok := s.(Stater); ok {
-			return st, true
-		}
-		u, ok := s.(storeUnwrapper)
-		if !ok {
-			return nil, false
-		}
-		s = u.Unwrap()
-	}
-	return nil, false
-}
-
-func stat(ctx context.Context, s Store, d Digest) (int64, error) {
-	if st, ok := AsStater(s); ok {
-		return st.Stat(ctx, d)
-	}
-	m, err := s.Get(ctx, d)
-	return m.Size, err
 }
 
 // Presigner is an optional capability a [Store] may implement. Instead of

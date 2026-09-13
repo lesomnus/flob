@@ -3,6 +3,7 @@ package flob
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestStater(t *testing.T) {
+func TestStat(t *testing.T) {
 	factories := map[string]newStoresFn{
 		"memory": func(t *testing.T) Stores { return NewMemStores() },
 		"os":     func(t *testing.T) Stores { return NewOsStores(t.TempDir()) },
@@ -21,10 +22,7 @@ func TestStater(t *testing.T) {
 			ctx := t.Context()
 			stores := factory(t)
 			s := stores.Use("a")
-			st, ok := AsStater(s)
-			if !ok {
-				t.Fatal("missing Stater")
-			}
+			st := s
 			for _, d := range []Digest{digest_nil, "", "../invalid", "sha256:bad"} {
 				if _, err := st.Stat(ctx, d); !errors.Is(err, ErrNotExist) {
 					t.Fatalf("Stat(%q): %v", d, err)
@@ -35,11 +33,11 @@ func TestStater(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				size, err := st.Stat(ctx, m.Digest)
-				if err != nil || size != int64(len(content)) {
-					t.Fatalf("Stat = %d, %v", size, err)
+				info, err := st.Stat(ctx, m.Digest)
+				if err != nil || info.Digest() != m.Digest || info.Size() != int64(len(content)) {
+					t.Fatalf("Stat = %v, %v", info, err)
 				}
-				other, _ := AsStater(stores.Use("b"))
+				other := stores.Use("b")
 				if _, err := other.Stat(ctx, m.Digest); !errors.Is(err, ErrNotExist) {
 					t.Fatalf("cross-store Stat: %v", err)
 				}
@@ -54,13 +52,13 @@ func TestStater(t *testing.T) {
 	}
 }
 
-func TestOsStatDoesNotReadLabels(t *testing.T) {
+func TestOsInfoDoesNotReadLabelsUntilRequested(t *testing.T) {
 	s := NewOsStores(t.TempDir()).Use("a").(OsStore)
 	m, err := s.Add(t.Context(), Meta{}, strings.NewReader("hello"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A directory at the labels path reliably makes Get fail, even as root.
+	// A directory at the labels path reliably makes reading fail, even as root.
 	p := s.pathToRepo(m.Digest, "labels")
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
@@ -68,42 +66,76 @@ func TestOsStatDoesNotReadLabels(t *testing.T) {
 	if err := os.Mkdir(p, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Get(t.Context(), m.Digest); err == nil {
-		t.Fatal("Get unexpectedly read invalid labels")
+	statCtx, cancel := context.WithCancel(t.Context())
+	info, err := s.Stat(statCtx, m.Digest)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
 	}
-	size, err := s.Stat(t.Context(), m.Digest)
-	if err != nil || size != 5 {
-		t.Fatalf("Stat = %d, %v", size, err)
+	r, opened, err := s.Open(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil || string(data) != "hello" {
+		t.Fatalf("Open content = %q, %v", data, err)
+	}
+	for _, info := range []Info{info, opened} {
+		if info.Digest() != m.Digest || info.Size() != 5 {
+			t.Fatalf("Info = %v", info)
+		}
+		if _, err := info.Labels(t.Context()); err == nil {
+			t.Fatal("Labels unexpectedly read invalid labels")
+		}
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Label(t.Context(), m.Digest, Labels{"Version": {"first"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, info := range []Info{info, opened} {
+		labels, err := info.Labels(t.Context())
+		if err != nil || labels.Get("Version") != "first" {
+			t.Fatalf("retry Labels = %v, %v", labels, err)
+		}
+	}
+	if err := s.Label(t.Context(), m.Digest, Labels{"Version": {"second"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, info := range []Info{info, opened} {
+		labels, err := info.Labels(t.Context())
+		if err != nil || labels.Get("Version") != "first" {
+			t.Fatalf("cached Labels = %v, %v", labels, err)
+		}
+	}
+	fresh, err := s.Stat(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels, err := fresh.Labels(t.Context())
+	if err != nil || labels.Get("Version") != "second" {
+		t.Fatalf("fresh Labels = %v, %v", labels, err)
+	}
+
 }
 
 type statTestWrapper struct{ Store }
 
 func (s statTestWrapper) Unwrap() Store { return s.Store }
 
-type getOnlyStatStore struct {
+type fixedStatStore struct {
 	UnimplementedStore
 	size int64
 	err  error
 }
 
-func (s getOnlyStatStore) Get(context.Context, Digest) (Meta, error) {
-	return Meta{Size: s.size}, s.err
-}
-
-func TestAsStater(t *testing.T) {
-	s := NewMemStores().Use("a")
-	for _, decorated := range []Store{s, statTestWrapper{AllowDuplicates(CheckExistence(PrepareDigest(s, "")))}} {
-		got, ok := AsStater(decorated)
-		if !ok || got != s.(Stater) {
-			t.Fatalf("AsStater = %v, %v", got, ok)
-		}
+func (s fixedStatStore) Stat(_ context.Context, d Digest) (Info, error) {
+	if s.err != nil {
+		return nil, s.err
 	}
-	for _, s := range []Store{nil, UnimplementedStore{}, statTestWrapper{nil}} {
-		if got, ok := AsStater(s); ok || got != nil {
-			t.Fatalf("AsStater = %v, %v", got, ok)
-		}
-	}
+	return NewInfo(d, s.size, nil), nil
 }
 
 func TestCompositeStat(t *testing.T) {
@@ -119,26 +151,53 @@ func TestCompositeStat(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, primary := range []Store{NewMemStores().Use("empty"), ErrorStore{Err: errors.New("unavailable")}} {
-				s, _ := AsStater(statTestWrapper{factory(primary, origin)})
-				size, err := s.Stat(t.Context(), m.Digest)
-				if err != nil || size != 5 {
-					t.Fatalf("origin Stat = %d, %v", size, err)
+				s := statTestWrapper{factory(primary, origin)}
+				info, err := s.Stat(t.Context(), m.Digest)
+				if err != nil || info.Size() != 5 {
+					t.Fatalf("origin Stat = %v, %v", info, err)
 				}
 			}
-			// Get-only children retain both fallback and primary precedence.
+			// Children retain both fallback and primary precedence.
 			for _, primaryErr := range []error{nil, ErrNotExist} {
-				s, _ := AsStater(factory(getOnlyStatStore{size: 7, err: primaryErr}, getOnlyStatStore{size: 9}))
+				s := factory(fixedStatStore{size: 7, err: primaryErr}, fixedStatStore{size: 9})
 				want := int64(7)
 				if primaryErr != nil {
 					want = 9
 				}
-				size, err := s.Stat(t.Context(), m.Digest)
-				if err != nil || size != want {
-					t.Fatalf("Get fallback = %d, %v; want %d", size, err, want)
+				info, err := s.Stat(t.Context(), m.Digest)
+				if err != nil || info.Size() != want {
+					t.Fatalf("Stat fallback = %v, %v; want %d", info, err, want)
 				}
 			}
+			// An Info returned from the origin stays bound to it even when the
+			// primary gains the blob before labels are requested.
+			primary := NewMemStores().Use("primary")
+			if err := origin.Label(t.Context(), m.Digest, Labels{"Source": {"origin"}}); err != nil {
+				t.Fatal(err)
+			}
+			composite := factory(primary, origin)
+			fromOrigin, err := composite.Stat(t.Context(), m.Digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := primary.Add(t.Context(), Meta{Labels: Labels{"Source": {"primary"}}}, strings.NewReader("hello")); err != nil {
+				t.Fatal(err)
+			}
+			labels, err := fromOrigin.Labels(t.Context())
+			if err != nil || labels.Get("Source") != "origin" {
+				t.Fatalf("origin Info Labels = %v, %v", labels, err)
+			}
+			fromPrimary, err := composite.Stat(t.Context(), m.Digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			labels, err = fromPrimary.Labels(t.Context())
+			if err != nil || labels.Get("Source") != "primary" {
+				t.Fatalf("fresh Info Labels = %v, %v", labels, err)
+			}
+
 			wantErr := errors.New("origin unavailable")
-			s, _ := AsStater(factory(ErrorStore{Err: ErrNotExist}, ErrorStore{Err: wantErr}))
+			s := factory(ErrorStore{Err: ErrNotExist}, ErrorStore{Err: wantErr})
 			if _, err := s.Stat(t.Context(), m.Digest); !errors.Is(err, wantErr) {
 				t.Fatalf("origin error = %v", err)
 			}
@@ -163,9 +222,9 @@ func TestS3StatReadsReferenceSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, _ := AsStater(stores.Use("a"))
-	size, err := st.Stat(t.Context(), d)
-	if err != nil || size != 5 || calls != 1 {
-		t.Fatalf("Stat = %d, %v (%d requests)", size, err, calls)
+	st := stores.Use("a")
+	info, err := st.Stat(t.Context(), d)
+	if err != nil || info.Size() != 5 || calls != 1 {
+		t.Fatalf("Stat = %v, %v (%d requests)", info, err, calls)
 	}
 }

@@ -50,28 +50,38 @@ semantics (cross-store dedup, per-store visibility):
   AWS SDK dependency; blobs are deduplicated by SHA-256 key and stores are isolated
   by per-store reference markers (see [`s3.md`](./s3.md)).
 
-## Existence and size
+## Blob information and lazy labels
 
-`Stater` is an optional capability for checking existence and size without
-retrieving labels. Discover it through decorators with `AsStater`:
+`Store.Stat` checks existence and returns an `Info` with the blob's digest and
+size. `Store.Open` returns the same kind of information alongside its reader.
+Labels are loaded only when requested:
 
 ```go
-var size int64
-var err error
-if st, ok := flob.AsStater(store); ok {
-    size, err = st.Stat(ctx, digest)
-} else {
-    var meta flob.Meta
-    meta, err = store.Get(ctx, digest)
-    size = meta.Size
+info, err := store.Stat(ctx, digest)
+if err != nil {
+    return err
 }
+size := info.Size()
+labels, err := info.Labels(ctx)
 ```
 
-The filesystem, memory, and S3 backends implement it. Filesystem `Stat` reads
-only the blob's file information; S3 sends a HEAD for the store's reference
-marker. Missing blobs return `ErrNotExist`, including blobs only present in
-another store. `CacheStore` and `FallbackStore` preserve their usual read
-fallbacks, using `Get` for children without this capability.
+Filesystem `Stat` and `Open` do not open the labels file. S3 and HTTP already
+receive labels with their metadata response, so accessing them needs no extra
+request. Missing blobs return `ErrNotExist` from `Stat` or `Open` immediately;
+label-loading errors are reported by `Labels`.
+
+Each `Info` caches its first successful labels load and returns independent
+copies. Failed loads can be retried, and each attempt uses the context supplied
+to `Labels`. Digest, size, and labels are not guaranteed to describe one atomic
+snapshot: the blob or labels may change between the initial lookup and the
+first labels access. Obtain a new `Info` to refresh a successful labels result.
+Cache and fallback stores keep labels bound to the store that supplied the info.
+
+This is a breaking API change: `Get`, the optional `Stater`, and `AsStater` have
+been removed. Replace `Get` with `Stat`, use `Digest()` and `Size()`, and call
+`Labels(ctx)` when needed. Store implementations must implement `Stat` and
+return `Info` from `Open`; `NewInfo` provides a loader with the caching behavior
+above. `Meta` remains the data type used by `Add` and `PresignOpen`.
 
 ## Design & Consistency
 
@@ -122,9 +132,9 @@ reason:
 - **Duplicate add returns partial metadata.** When you `Add` content whose digest already
   exists, the existing blob is intentionally *not* re-read, so the returned `Meta` may carry
   `Size == 0`. The stored content is untouched and authoritative; fetch the real size with
-  `Get`/`HEAD` (over HTTP, this is a `200 OK` with only the `ETag` set — see `http.md`).
+  `Stat`/`HEAD` (over HTTP, this is a `200 OK` with only the `ETag` set — see `http.md`).
 - **Consistent existence semantics.** "Does this blob exist?" is answered by the presence of
-  the `blob` file everywhere (`Get`, `Open`, `Label`), so an orphaned labels-only directory
+  the `blob` file everywhere (`Stat`, `Open`, `Label`), so an orphaned labels-only directory
   is uniformly treated as *not existing*; `Label` on such a stray entry returns `ErrNotExist`
   just like a read would.
 - **In-memory store `Label`/`Erase` races are not serialized.** For `MemStore`, a `Label`

@@ -196,16 +196,21 @@ func NewCmdGet() *xli.Command {
 				return z.Err(err, "resolve digest")
 			}
 
-			m, err := s.Use(id).Get(ctx, d)
+			info, err := s.Use(id).Stat(ctx, d)
 			if err != nil {
 				return z.Err(err, "op")
 			}
 
-			cmd.Println("Digest:", m.Digest)
-			cmd.Println("Size:", m.Size)
-			if len(m.Labels) > 0 {
+			labels, err := info.Labels(ctx)
+			if err != nil {
+				return z.Err(err, "labels")
+			}
+
+			cmd.Println("Digest:", info.Digest())
+			cmd.Println("Size:", info.Size())
+			if len(labels) > 0 {
 				cmd.Println("Labels:")
-				for k, v := range m.Labels {
+				for k, v := range labels {
 					cmd.Println("  ", k, "=", v)
 				}
 			}

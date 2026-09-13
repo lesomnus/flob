@@ -48,7 +48,7 @@ func TestAddAll(t *testing.T) {
 			if r.digest == "" {
 				t.Fatalf("file %d: no digest", i)
 			}
-			if _, err := store.Get(ctx, r.digest); err != nil {
+			if _, err := store.Stat(ctx, r.digest); err != nil {
 				t.Fatalf("file %d: not in the store: %v", i, err)
 			}
 		}

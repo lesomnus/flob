@@ -24,11 +24,11 @@ type UnimplementedStore struct{}
 func (s UnimplementedStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return Meta{}, ErrUnimplemented
 }
-func (s UnimplementedStore) Get(ctx context.Context, d Digest) (Meta, error) {
-	return Meta{}, ErrUnimplemented
+func (s UnimplementedStore) Stat(ctx context.Context, d Digest) (Info, error) {
+	return nil, ErrUnimplemented
 }
-func (s UnimplementedStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
-	return nil, Meta{}, ErrUnimplemented
+func (s UnimplementedStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
+	return nil, nil, ErrUnimplemented
 }
 func (s UnimplementedStore) Label(ctx context.Context, d Digest, labels Labels) error {
 	return ErrUnimplemented
@@ -60,11 +60,11 @@ type ErrorStore struct {
 func (s ErrorStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return Meta{}, s.Err
 }
-func (s ErrorStore) Get(ctx context.Context, d Digest) (Meta, error) {
-	return Meta{}, s.Err
+func (s ErrorStore) Stat(ctx context.Context, d Digest) (Info, error) {
+	return nil, s.Err
 }
-func (s ErrorStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
-	return nil, Meta{}, s.Err
+func (s ErrorStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
+	return nil, nil, s.Err
 }
 func (s ErrorStore) Label(ctx context.Context, d Digest, labels Labels) error {
 	return s.Err
@@ -99,24 +99,16 @@ func (s FallbackStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, erro
 	return s.Primary.Add(ctx, m, r)
 }
 
-// Stat follows the same fallback policy as Get, using [Stater] when available.
-func (s FallbackStore) Stat(ctx context.Context, d Digest) (int64, error) {
-	size, err := stat(ctx, s.Primary, d)
+// Stat reads the primary first, falling back to the secondary on failure.
+func (s FallbackStore) Stat(ctx context.Context, d Digest) (Info, error) {
+	info, err := s.Primary.Stat(ctx, d)
 	if err == nil {
-		return size, nil
+		return info, nil
 	}
-	return stat(ctx, s.Secondary, d)
+	return s.Secondary.Stat(ctx, d)
 }
 
-func (s FallbackStore) Get(ctx context.Context, d Digest) (Meta, error) {
-	m, err := s.Primary.Get(ctx, d)
-	if err == nil {
-		return m, nil
-	}
-
-	return s.Secondary.Get(ctx, d)
-}
-func (s FallbackStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
+func (s FallbackStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
 	r, m, err := s.Primary.Open(ctx, d)
 	if err == nil {
 		return r, m, nil
@@ -161,8 +153,9 @@ func CheckExistence(s Store) Store {
 
 func (s checkExistence) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	if m.Digest != "" {
-		if m, err := s.Store.Get(ctx, m.Digest); err == nil {
-			return m, ErrAlreadyExists
+		if info, err := s.Store.Stat(ctx, m.Digest); err == nil {
+			// Duplicate checks do not load labels; return only the known identity and size.
+			return Meta{Digest: info.Digest(), Size: info.Size()}, ErrAlreadyExists
 		}
 	}
 	return s.Store.Add(ctx, m, r)

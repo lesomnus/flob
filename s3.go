@@ -12,7 +12,7 @@ package flob
 // A blob is content-addressed, so identical content from any store resolves to
 // the same blob/ key and is uploaded once. Visibility is per store: a blob is
 // observable from a store only if that store's refs/ marker exists, and every
-// existence decision (Get/Open/Label/Add's dup check) reads the marker, never
+// existence decision (Stat/Open/Label/Add's dup check) reads the marker, never
 // the shared blob/ object. Erase removes the marker and, when no marker remains
 // for the digest, best-effort removes the shared blob.
 
@@ -382,49 +382,32 @@ func (s *S3Store) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return m.Clone(), nil
 }
 
-// Stat implements [Stater] with a HEAD of this store's reference marker.
-func (s *S3Store) Stat(ctx context.Context, d Digest) (int64, error) {
+func (s *S3Store) Stat(ctx context.Context, d Digest) (Info, error) {
 	d, err := d.Sanitize()
 	if err != nil {
-		return 0, ErrNotExist
-	}
-	res, err := s.stores.head(ctx, s.stores.refKey(d, s.id))
-	if err != nil {
-		return 0, err
-	}
-	defer res.Body.Close()
-
-	// Reference markers are empty; their metadata holds the blob's size.
-	size, _ := strconv.ParseInt(res.Header.Get(metaPrefix+metaSizeKey), 10, 64)
-	return size, nil
-}
-
-func (s *S3Store) Get(ctx context.Context, d Digest) (Meta, error) {
-	d, err := d.Sanitize()
-	if err != nil {
-		return Meta{}, ErrNotExist
+		return nil, ErrNotExist
 	}
 
 	res, err := s.stores.head(ctx, s.stores.refKey(d, s.id))
 	if err != nil {
-		return Meta{}, err
+		return nil, err
 	}
 	defer res.Body.Close()
 
 	labels, size := metaToLabels(res.Header)
-	return Meta{Digest: d, Size: size, Labels: labels}, nil
+	return NewInfo(d, size, func(context.Context) (Labels, error) { return labels, nil }), nil
 }
 
-func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, error) {
+func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
 	d, err := d.Sanitize()
 	if err != nil {
-		return nil, Meta{}, ErrNotExist
+		return nil, nil, ErrNotExist
 	}
 
 	// Gate on this store's reference for isolation, and read labels/size from it.
 	hres, err := s.stores.head(ctx, s.stores.refKey(d, s.id))
 	if err != nil {
-		return nil, Meta{}, err
+		return nil, nil, err
 	}
 	labels, size := metaToLabels(hres.Header)
 	hres.Body.Close()
@@ -433,11 +416,11 @@ func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, 
 	// io.ReadSeekCloser, matching HttpStore.Open.
 	req, err := s.stores.newRequest(ctx, http.MethodGet, s.stores.blobKey(d), nil, nil)
 	if err != nil {
-		return nil, Meta{}, err
+		return nil, nil, err
 	}
 	res, err := s.stores.send(req, emptyPayloadHash)
 	if err != nil {
-		return nil, Meta{}, err
+		return nil, nil, err
 	}
 	defer res.Body.Close()
 	switch res.StatusCode {
@@ -446,16 +429,16 @@ func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Meta, 
 	case http.StatusNotFound:
 		// Reference exists but shared blob is gone (a lost dedup race); the
 		// content is not readable, so report it as missing.
-		return nil, Meta{}, ErrNotExist
+		return nil, nil, ErrNotExist
 	default:
-		return nil, Meta{}, statusError("get blob", res)
+		return nil, nil, statusError("get blob", res)
 	}
 
 	data, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, Meta{}, fmt.Errorf("read blob: %w", err)
+		return nil, nil, fmt.Errorf("read blob: %w", err)
 	}
-	return nopCloser{bytes.NewReader(data)}, Meta{Digest: d, Size: size, Labels: labels}, nil
+	return nopCloser{bytes.NewReader(data)}, NewInfo(d, size, func(context.Context) (Labels, error) { return labels, nil }), nil
 }
 
 // PresignOpen implements [Presigner]: it returns a short-lived direct download
