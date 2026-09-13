@@ -140,7 +140,7 @@ func (s fixedStatStore) Stat(_ context.Context, d Digest) (Info, error) {
 
 func TestCompositeStat(t *testing.T) {
 	factories := map[string]func(Store, Store) Store{
-		"cache":    func(p, o Store) Store { return CacheStore{Primary: p, Origin: o} },
+		"cache":    func(p, o Store) Store { return &CacheStore{Primary: p, Origin: o} },
 		"fallback": func(p, o Store) Store { return FallbackStore{Primary: p, Secondary: o} },
 	}
 	for name, factory := range factories {

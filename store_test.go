@@ -559,12 +559,12 @@ func TestLinkStore(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				wrappedSource := AllowDuplicates(CheckExistence(PrepareDigest(CacheStore{Primary: source, Origin: stores.Use("origin")}, Canonical)))
+				wrappedSource := AllowDuplicates(CheckExistence(PrepareDigest(&CacheStore{Primary: source, Origin: stores.Use("origin")}, Canonical)))
 				wrappedTarget := AllowDuplicates(FallbackStore{Primary: target, Secondary: stores.Use("secondary")})
 				if _, err := requireLinker(t, wrappedTarget).Link(t.Context(), added.Digest, wrappedSource); err != nil {
 					t.Fatal(err)
 				}
-				for _, wrapper := range []Store{CacheStore{Primary: stores.Use("missing"), Origin: source}, FallbackStore{Primary: stores.Use("missing"), Secondary: source}} {
+				for _, wrapper := range []Store{&CacheStore{Primary: stores.Use("missing"), Origin: source}, FallbackStore{Primary: stores.Use("missing"), Secondary: source}} {
 					fresh := stores.Use("fresh")
 					if _, err := requireLinker(t, fresh).Link(t.Context(), added.Digest, wrapper); !errors.Is(err, ErrNotExist) {
 						t.Fatalf("origin-only source Link = %v", err)
@@ -583,7 +583,7 @@ func TestLinkerDiscovery(t *testing.T) {
 		}
 	}
 	source := NewMemStores().Use("source")
-	for _, store := range []Store{CacheStore{Primary: UnimplementedStore{}, Origin: source}, FallbackStore{Primary: UnimplementedStore{}, Secondary: source}} {
+	for _, store := range []Store{&CacheStore{Primary: UnimplementedStore{}, Origin: source}, FallbackStore{Primary: UnimplementedStore{}, Secondary: source}} {
 		if _, ok := AsLinker(store); ok {
 			t.Fatal("secondary Linker was exposed")
 		}

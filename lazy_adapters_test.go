@@ -73,7 +73,7 @@ func TestCacheLazyLabelsFailureStillStreams(t *testing.T) {
 	})
 	primary := &cacheWriteRecorder{ErrorStore: ErrorStore{Err: ErrNotExist}}
 	origin := lazyAdapterStore{info: info, body: &closeRecordingReader{Reader: strings.NewReader(content)}}
-	store := CacheStore{Primary: primary, Origin: origin}
+	store := &CacheStore{Primary: primary, Origin: origin}
 	body, gotInfo, err := store.Open(t.Context(), d)
 	if err != nil {
 		t.Fatal(err)
