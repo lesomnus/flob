@@ -1,11 +1,15 @@
 package flob
 
 import (
+	"context"
 	"crypto/sha256"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -588,3 +592,301 @@ func (u unwrapStore) Unwrap() Store { return u.Store }
 // hiddenStore embeds Store and does NOT implement Unwrap, so it opaquely hides any
 // optional capability of the store beneath it.
 type hiddenStore struct{ Store }
+
+func TestS3LinkOnlyTransfersReference(t *testing.T) {
+	mock := newMockS3("bucket")
+	var mu sync.Mutex
+	var calls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/refs/") {
+			data, err := io.ReadAll(r.Body)
+			if err != nil || len(data) != 0 {
+				t.Errorf("reference body = %q, %v", data, err)
+			}
+			r.Body = io.NopCloser(strings.NewReader(string(data)))
+		}
+		mock.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	stores, err := NewS3Stores(S3Config{Endpoint: srv.URL, Region: "us-east-1", Bucket: "bucket", UsePathStyle: true, Credentials: Credentials{AccessKeyID: "key", SecretAccessKey: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := stores.Use("source").(*S3Store)
+	dest := stores.Use("dest").(*S3Store)
+	added, err := source.Add(t.Context(), Meta{Labels: Labels{"Owner": {"source"}}}, strings.NewReader("content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	calls = nil
+	mu.Unlock()
+	linked, err := dest.Link(t.Context(), added.Digest, AllowDuplicates(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked.Digest != added.Digest || linked.Size != 7 || linked.Labels.Get("Owner") != "source" {
+		t.Fatalf("Link Meta = %#v", linked)
+	}
+	mu.Lock()
+	gotCalls := append([]string(nil), calls...)
+	mu.Unlock()
+	want := []string{"HEAD /bucket/" + stores.refKey(added.Digest, "source"), "PUT /bucket/" + stores.refKey(added.Digest, "dest")}
+	if fmt.Sprint(gotCalls) != fmt.Sprint(want) {
+		t.Fatalf("Link requests = %v; want %v", gotCalls, want)
+	}
+	linked.Labels["Owner"][0] = "mutated"
+	if err := source.Erase(t.Context(), added.Digest); err != nil {
+		t.Fatal(err)
+	}
+	r, info, err := dest.Open(t.Context(), added.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil || string(data) != "content" {
+		t.Fatalf("linked content = %q, %v", data, err)
+	}
+	labels, err := info.Labels(t.Context())
+	if err != nil || labels.Get("Owner") != "source" {
+		t.Fatalf("linked labels = %v, %v", labels, err)
+	}
+}
+
+func TestS3LinkVisibilityAndDuplicates(t *testing.T) {
+	stores, _ := newMockS3Stores(t)
+	source := stores.Use("source").(*S3Store)
+	dest := stores.Use("dest").(*S3Store)
+	m, err := source.Add(t.Context(), Meta{Labels: Labels{"Owner": {"source"}}}, strings.NewReader("content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dest.Link(t.Context(), m.Digest, stores.Use("missing")); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("missing source = %v", err)
+	}
+	if _, err := dest.Stat(t.Context(), m.Digest); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("missing source created target: %v", err)
+	}
+	const n = 12
+	results := make(chan error, n)
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() { _, err := dest.Link(t.Context(), m.Digest, source); results <- err })
+	}
+	wg.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		} else if !errors.Is(err, ErrAlreadyExists) {
+			t.Fatal(err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful concurrent links = %d", successes)
+	}
+	if err := dest.Label(t.Context(), m.Digest, Labels{"Owner": {"dest"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, from := range []Store{source, dest} {
+		if _, err := dest.Link(t.Context(), m.Digest, from); !errors.Is(err, ErrAlreadyExists) {
+			t.Fatalf("duplicate = %v", err)
+		}
+	}
+	info, err := dest.Stat(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels, err := info.Labels(t.Context())
+	if err != nil || labels.Get("Owner") != "dest" {
+		t.Fatalf("duplicate replaced labels: %v, %v", labels, err)
+	}
+	if _, err := dest.Link(t.Context(), m.Digest, stores.Use("missing")); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("source missing priority = %v", err)
+	}
+	other, _ := newMockS3Stores(t)
+	var nilSource *S3Store
+	sameBackendDifferentPool := *stores
+	for _, from := range []Store{nil, nilSource, NewMemStores().Use("source"), other.Use("source"), sameBackendDifferentPool.Use("source")} {
+		if _, err := dest.Link(t.Context(), m.Digest, from); !errors.Is(err, ErrIncompatibleStore) {
+			t.Fatalf("incompatible = %v", err)
+		}
+	}
+	if _, err := dest.Link(t.Context(), "bad", source); err == nil {
+		t.Fatal("invalid digest accepted")
+	}
+}
+
+func TestS3LinkConditionalConflict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set(metaPrefix+metaSizeKey, "7")
+		case http.MethodPut:
+			if r.Header.Get("If-None-Match") != "*" {
+				t.Error("missing conditional create")
+			}
+			w.WriteHeader(http.StatusConflict)
+		default:
+			t.Errorf("unexpected %s", r.Method)
+		}
+	}))
+	defer srv.Close()
+	stores, err := NewS3Stores(S3Config{Endpoint: srv.URL, Region: "us-east-1", Bucket: "bucket", UsePathStyle: true, Credentials: Credentials{AccessKeyID: "key", SecretAccessKey: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = stores.Use("dest").(*S3Store).Link(t.Context(), DigestFromBytes([]byte("content")), stores.Use("source"))
+	if err == nil || errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("conditional conflict = %v", err)
+	}
+}
+
+func walkS3Server(t *testing.T, handler http.HandlerFunc) *S3Stores {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	s, err := NewS3Stores(S3Config{Endpoint: srv.URL, Bucket: "bucket", Region: "us-east-1", UsePathStyle: true, Credentials: Credentials{AccessKeyID: "key", SecretAccessKey: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestS3WalkPages(t *testing.T) {
+	d := DigestFromBytes([]byte("hello"))
+	deleted := DigestFromBytes([]byte("deleted"))
+	ref := func(d Digest, id string) string {
+		return "refs/" + d.Algorithm().String() + "/" + d.Encoded() + "/" + namespaceSegment(id)
+	}
+	lists, heads := 0, 0
+	s := walkS3Server(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			lists++
+			if r.URL.Query().Get("list-type") != "2" || r.URL.Query().Get("encoding-type") != "url" {
+				t.Error("not URL-encoded ListObjectsV2")
+			}
+			var keys []string
+			next := ""
+			switch r.URL.Query().Get("continuation-token") {
+			case "":
+				keys = []string{ref(d, "other"), ref(deleted, "a/b"), "refs/sha256/bad/a", "refs/sha256/" + d.Encoded() + "/~YQ"}
+				next = "next+/=&"
+			case "next+/=&":
+				keys = []string{ref(d, "a/b")}
+			default:
+				t.Error("wrong token")
+			}
+			page := s3ListPage{EncodingType: "url", IsTruncated: next != "", NextContinuationToken: next}
+			for _, key := range keys {
+				page.Contents = append(page.Contents, struct{ Key string }{url.PathEscape(key)})
+			}
+			xml.NewEncoder(w).Encode(page)
+		case http.MethodHead:
+			heads++
+			if strings.Contains(r.URL.Path, deleted.Encoded()) {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set(metaPrefix+metaSizeKey, "5")
+			w.Header().Set(metaPrefix+"owner", "value")
+		default:
+			t.Errorf("unexpected blob I/O: %s %s", r.Method, r.URL)
+		}
+	})
+	count := 0
+	for info, err := range s.Use("a/b").(*S3Store).Walk(t.Context()) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		count++
+		if info.Digest() != d || info.Size() != 5 {
+			t.Fatalf("Info = %v", info)
+		}
+		labels, err := info.Labels(t.Context())
+		if err != nil || labels.Get("owner") != "value" {
+			t.Fatalf("labels = %v, %v", labels, err)
+		}
+	}
+	if count != 1 || lists != 2 || heads != 2 {
+		t.Fatalf("count/list/head = %d/%d/%d", count, lists, heads)
+	}
+	lists, heads = 0, 0
+	got := map[string]bool{}
+	for id, err := range s.Namespaces(t.Context()) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[id] = true
+	}
+	if len(got) != 2 || !got["a/b"] || !got["other"] || lists != 2 || heads != 0 {
+		t.Fatalf("namespaces %v list/head %d/%d", got, lists, heads)
+	}
+}
+
+func TestS3EnumerationStops(t *testing.T) {
+	d := DigestFromBytes([]byte("hello"))
+	key := "refs/sha256/" + d.Encoded() + "/a"
+	for _, mode := range []string{"break", "cancel", "missing-token", "repeated-token", "bad-xml", "http-error", "bad-escape"} {
+		t.Run(mode, func(t *testing.T) {
+			calls := 0
+			s := walkS3Server(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if mode == "http-error" {
+					w.WriteHeader(503)
+					return
+				}
+				if mode == "bad-xml" {
+					fmt.Fprint(w, "<broken>")
+					return
+				}
+				page := s3ListPage{IsTruncated: true, NextContinuationToken: "same"}
+				if mode == "missing-token" {
+					page.NextContinuationToken = ""
+				}
+				if mode == "bad-escape" {
+					page.EncodingType = "url"
+					page.Contents = append(page.Contents, struct{ Key string }{"%bad%"})
+				} else {
+					page.Contents = append(page.Contents, struct{ Key string }{key})
+				}
+				xml.NewEncoder(w).Encode(page)
+			})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			values, errs := 0, 0
+			for _, err := range s.Namespaces(ctx) {
+				if err != nil {
+					errs++
+					continue
+				}
+				values++
+				if mode == "break" {
+					break
+				}
+				if mode == "cancel" {
+					cancel()
+				}
+			}
+			if mode == "break" {
+				if values != 1 || errs != 0 || calls != 1 {
+					t.Fatalf("break: %d/%d/%d", values, errs, calls)
+				}
+			} else if errs != 1 {
+				t.Fatalf("errors=%d calls=%d", errs, calls)
+			}
+			if mode == "cancel" && calls != 1 {
+				t.Fatalf("I/O after cancel: %d", calls)
+			}
+			if mode == "repeated-token" && calls != 2 {
+				t.Fatalf("token loop: %d", calls)
+			}
+		})
+	}
+}

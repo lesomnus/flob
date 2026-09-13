@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"iter"
 	"sync"
 	"sync/atomic"
 )
@@ -207,4 +208,117 @@ type nopCloser struct{ *bytes.Reader }
 
 func (nopCloser) Close() error {
 	return nil
+}
+
+var _ Linker = (*MemStore)(nil)
+
+// Link shares the source's immutable blob while creating independent labels.
+func (s *MemStore) Link(ctx context.Context, d Digest, from Store) (Meta, error) {
+	if err := ctx.Err(); err != nil {
+		return Meta{}, err
+	}
+	d, err := d.Sanitize()
+	if err != nil {
+		return Meta{}, err
+	}
+	m := Meta{Digest: d}
+	source, ok := unwrapLinkSource(from).(*MemStore)
+	if !ok || source == nil || source.g != s.g {
+		return m, ErrIncompatibleStore
+	}
+	v, ok := source.es.Load(d)
+	if !ok {
+		return m, ErrNotExist
+	}
+	entry := v.(*memEntry)
+	b := entry.blob
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Erase removes the entry before taking this lock. Recheck it so a removed
+	// source cannot resurrect an unreferenced blob or corrupt reference counts.
+	if current, ok := source.es.Load(d); !ok || current != entry {
+		return m, ErrNotExist
+	}
+	if _, ok := s.es.Load(d); ok {
+		return m, ErrAlreadyExists
+	}
+	m.Size = int64(len(b.data))
+	if labels := entry.labels.Load(); labels != nil {
+		m.Labels = cloneLabels(*labels)
+	}
+	e := &memEntry{blob: b}
+	if m.Labels != nil {
+		labels := cloneLabels(m.Labels)
+		e.labels.Store(&labels)
+	}
+	if err := ctx.Err(); err != nil {
+		return m, err
+	}
+	if _, loaded := s.es.LoadOrStore(d, e); loaded {
+		return Meta{Digest: d}, ErrAlreadyExists
+	}
+	b.refs++
+	return m, nil
+}
+
+var _ Walker = (*MemStore)(nil)
+var _ Namespacer = (*MemStores)(nil)
+
+func (s *MemStore) Walk(ctx context.Context) iter.Seq2[Info, error] {
+	return func(yield func(Info, error) bool) {
+		if err := ctx.Err(); err != nil {
+			yield(nil, err)
+			return
+		}
+		s.es.Range(func(key, value any) bool {
+			if err := ctx.Err(); err != nil {
+				yield(nil, err)
+				return false
+			}
+			entry := value.(*memEntry)
+			info := NewInfo(key.(Digest), int64(len(entry.blob.data)), func(ctx context.Context) (Labels, error) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				ls := entry.labels.Load()
+				if ls == nil {
+					return nil, nil
+				}
+				return *ls, nil
+			})
+			if !yield(info, nil) {
+				return false
+			}
+			if err := ctx.Err(); err != nil {
+				yield(nil, err)
+				return false
+			}
+			return true
+		})
+	}
+}
+
+func (s *MemStores) Namespaces(ctx context.Context) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		if err := ctx.Err(); err != nil {
+			yield("", err)
+			return
+		}
+		s.ss.Range(func(key, value any) bool {
+			if err := ctx.Err(); err != nil {
+				yield("", err)
+				return false
+			}
+			nonempty := false
+			value.(*MemStore).es.Range(func(_, _ any) bool { nonempty = true; return false })
+			if nonempty && !yield(key.(string), nil) {
+				return false
+			}
+			if err := ctx.Err(); err != nil {
+				yield("", err)
+				return false
+			}
+			return true
+		})
+	}
 }
