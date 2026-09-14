@@ -173,8 +173,8 @@ func TestHttpStoreLazyRanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	if info.Size() != int64(len(content)) {
-		t.Fatalf("size = %d", info.Size())
+	if mustSize(t, info) != int64(len(content)) {
+		t.Fatalf("size = %d", mustSize(t, info))
 	}
 	for _, seek := range []struct {
 		offset int64
@@ -454,8 +454,8 @@ func TestHttpStoreLargeLazyReadAndCancellation(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer reader.Close()
-			if info.Size() != 2147483648 {
-				t.Fatalf("size = %d", info.Size())
+			if mustSize(t, info) != 2147483648 {
+				t.Fatalf("size = %d", mustSize(t, info))
 			}
 			done := make(chan error, 1)
 			if mode != "close pending headers" {

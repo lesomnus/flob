@@ -578,7 +578,11 @@ func (s OsStore) Link(ctx context.Context, d Digest, from Store) (Meta, error) {
 	if err != nil {
 		return Meta{}, err
 	}
-	m := Meta{Digest: d, Size: info.Size()}
+	size, err := info.Size(ctx)
+	if err != nil {
+		return Meta{}, err
+	}
+	m := Meta{Digest: d, Size: size}
 	if err := s.checkDup(s.pathToRepo(d, "blob")); err != nil {
 		return m, err
 	}
@@ -633,8 +637,9 @@ var (
 	_ Namespacer = OsStores{}
 )
 
-// Walk inventories regular blob files in this namespace. Labels are loaded
-// only if requested through the returned Info. Symlinks are not followed.
+// Walk inventories regular blob files in this namespace from directory entries,
+// without a stat per blob. Size and labels are loaded only if requested through
+// the returned Info. Symlinks are not followed.
 func (s OsStore) Walk(ctx context.Context) iter.Seq2[Info, error] {
 	return func(yield func(Info, error) bool) {
 		err := filepath.WalkDir(s.repo, func(path string, entry fs.DirEntry, err error) error {
@@ -668,17 +673,16 @@ func (s OsStore) Walk(ctx context.Context) iter.Seq2[Info, error] {
 			if clean, err := d.Sanitize(); err != nil || clean != d {
 				return nil
 			}
-			fi, err := entry.Info()
-			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					return nil
-				}
-				return err
-			}
-			if !fi.Mode().IsRegular() {
+			if !entry.Type().IsRegular() {
 				return nil
 			}
-			info := NewInfo(d, fi.Size(), func(ctx context.Context) (Labels, error) {
+			info := NewLazyInfo(d, func(ctx context.Context) (int64, error) {
+				current, err := s.Stat(ctx, d)
+				if err != nil {
+					return 0, err
+				}
+				return current.Size(ctx)
+			}, func(ctx context.Context) (Labels, error) {
 				current, err := s.Stat(ctx, d)
 				if err != nil {
 					return nil, err
@@ -1285,7 +1289,11 @@ func (s *osStage) recoverCommit(l *osLockedStage) (Meta, error) {
 		if err != nil {
 			return Meta{}, err
 		}
-		if info.Size() != l.record.Offset {
+		size, err := info.Size(l.ctx)
+		if err != nil {
+			return Meta{}, err
+		}
+		if size != l.record.Offset {
 			return Meta{}, ErrStageFormat
 		}
 		if err := osStageRegular(l.root, filepath.Join(destination, "labels")); err != nil {

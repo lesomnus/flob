@@ -514,7 +514,7 @@ func TestOsWalkDoesNotReadLabels(t *testing.T) {
 		}
 		result = info
 	}
-	if result == nil || result.Size() != 7 {
+	if result == nil || mustSize(t, result) != 7 {
 		t.Fatalf("Info = %v", result)
 	}
 	if _, err := result.Labels(t.Context()); err == nil {

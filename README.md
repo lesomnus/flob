@@ -109,7 +109,7 @@ link endpoint or `Linker` capability.
 ## Namespace IDs
 
 `Use(id)` identifies a namespace by the exact bytes of `id`. OS directory names,
-S3 reference suffixes, and HTTP path segments use one shared encoding. Nonempty
+S3 reference segments, and HTTP path segments use one shared encoding. Nonempty
 ASCII names containing only letters, digits, `_`, `-`, and `.` stay unchanged,
 except names ending in `.`, and Windows device names such as `NUL` or `CON.txt`.
 All other IDs become `~` followed by unpadded URL-safe base64 of their bytes.
@@ -130,7 +130,7 @@ If any existing ID requires encoding, plan and export data **before upgrading**.
 Old and new layouts cannot safely be mixed: for example, a legacy raw namespace
 named `~Lg` occupies the new location for the ID `.`. Reading that location after
 upgrading would expose the old namespace through a different ID. This affects
-both OS directories and S3 reference suffixes, especially existing `~`-prefixed
+both OS directories and S3 reference segments, especially existing `~`-prefixed
 names. Names previously stored raw that now require encoding include slash,
 empty, dot, device, and `~`-prefixed IDs.
 
@@ -156,7 +156,9 @@ or erasing the last blob does not leave an enumerable namespace.
 if walker, ok := flob.AsWalker(store); ok {
     for info, err := range walker.Walk(ctx) {
         if err != nil { return err }
-        fmt.Println(info.Digest(), info.Size())
+        size, err := info.Size(ctx) // may issue a request; see below
+        if err != nil { return err }
+        fmt.Println(info.Digest(), size)
         // info.Labels(ctx) loads labels only if needed.
     }
 }
@@ -175,18 +177,28 @@ the loop stops further I/O. `AsWalker` and `AsNamespacer` follow decorator
 `Unwrap` methods; cache and fallback inventories describe their primary storage,
 not a union with the origin or secondary. HTTP does not expose enumeration.
 
+A walk reads only the inventory itself: S3 lists the namespace's references and
+the OS backend reads directory entries. Their `Info` values load size and labels
+on first use, with one reference `HEAD` on S3 or one `stat` on the filesystem. An
+entry removed after it was listed can report `ErrNotExist` from `Size` or `Labels`.
+
 ## Blob information and lazy labels
 
-`Store.Stat` checks existence and returns an `Info` with the blob's digest and
-size. `Store.Open` returns the same kind of information alongside its reader.
-Labels are loaded only when requested:
+`Store.Stat` checks existence and returns an `Info` with the blob's digest.
+`Store.Open` returns the same kind of information alongside its reader. Size and
+labels are read through methods that take a context. `Stat` and `Open` already
+know the size, so `Size` does no I/O for their results; labels are loaded only
+when requested:
 
 ```go
 info, err := store.Stat(ctx, digest)
 if err != nil {
     return err
 }
-size := info.Size()
+size, err := info.Size(ctx)
+if err != nil {
+    return err
+}
 labels, err := info.Labels(ctx)
 ```
 
@@ -195,18 +207,18 @@ receive labels with their metadata response, so accessing them needs no extra
 request. Missing blobs return `ErrNotExist` from `Stat` or `Open` immediately;
 label-loading errors are reported by `Labels`.
 
-Each `Info` caches its first successful labels load and returns independent
-copies. Failed loads can be retried, and each attempt uses the context supplied
+Each `Info` caches its first successful size and labels loads and returns
+independent copies of labels. Failed loads can be retried, and each attempt uses the context supplied
 to `Labels`. Digest, size, and labels are not guaranteed to describe one atomic
 snapshot: the blob or labels may change between the initial lookup and the
 first labels access. Obtain a new `Info` to refresh a successful labels result.
 Cache and fallback stores keep labels bound to the store that supplied the info.
 
 This is a breaking API change: `Get`, the optional `Stater`, and `AsStater` have
-been removed. Replace `Get` with `Stat`, use `Digest()` and `Size()`, and call
+been removed. Replace `Get` with `Stat`, use `Digest()` and `Size(ctx)`, and call
 `Labels(ctx)` when needed. Store implementations must implement `Stat` and
-return `Info` from `Open`; `NewInfo` provides a loader with the caching behavior
-above. `Meta` remains the data type used by `Add` and `PresignOpen`.
+return `Info` from `Open`; `NewInfo` provides a labels loader with the caching
+behavior above, and `NewLazyInfo` also defers the size. `Meta` remains the data type used by `Add` and `PresignOpen`.
 
 ## Design & Consistency
 

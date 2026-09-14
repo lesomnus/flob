@@ -161,7 +161,11 @@ func (s checkExistence) Add(ctx context.Context, m Meta, r io.Reader) (Meta, err
 	if m.Digest != "" {
 		if info, err := s.Store.Stat(ctx, m.Digest); err == nil {
 			// Duplicate checks do not load labels; return only the known identity and size.
-			return Meta{Digest: info.Digest(), Size: info.Size()}, ErrAlreadyExists
+			size, err := info.Size(ctx)
+			if err != nil {
+				return Meta{Digest: info.Digest()}, err
+			}
+			return Meta{Digest: info.Digest(), Size: size}, ErrAlreadyExists
 		}
 	}
 	return s.Store.Add(ctx, m, r)

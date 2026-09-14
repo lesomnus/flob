@@ -201,13 +201,18 @@ func NewCmdGet() *xli.Command {
 				return z.Err(err, "op")
 			}
 
+			size, err := info.Size(ctx)
+			if err != nil {
+				return z.Err(err, "size")
+			}
+
 			labels, err := info.Labels(ctx)
 			if err != nil {
 				return z.Err(err, "labels")
 			}
 
 			cmd.Println("Digest:", info.Digest())
-			cmd.Println("Size:", info.Size())
+			cmd.Println("Size:", size)
 			if len(labels) > 0 {
 				cmd.Println("Labels:")
 				for k, v := range labels {

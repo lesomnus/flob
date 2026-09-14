@@ -170,6 +170,12 @@ func (s *CacheStore) openOrigin(ctx context.Context, d Digest, finish func(error
 	stopFlightCancellation := context.AfterFunc(ctx, func() { finish(nil) })
 	fillCtx, cancelFill := context.WithCancel(ctx)
 	r, info, err := s.Origin.Open(ctx, d)
+	var size int64
+	if err == nil {
+		if size, err = info.Size(ctx); err != nil {
+			r.Close()
+		}
+	}
 	if err != nil {
 		cancelFill()
 		stopFlightCancellation()
@@ -180,14 +186,14 @@ func (s *CacheStore) openOrigin(ctx context.Context, d Digest, finish func(error
 		}
 		return nil, nil, err
 	}
-	tap, sink := newBlobTap(r, info.Size())
+	tap, sink := newBlobTap(r, size)
 	abort := func(err error) {
 		cancelFill()
 		sink.CloseWithError(err)
 		finish(nil)
 	}
 	tap.onAbort = abort
-	if info.Size() < 0 {
+	if size < 0 {
 		abort(io.ErrUnexpectedEOF)
 	}
 	stopSourceCancellation := context.AfterFunc(ctx, func() {
