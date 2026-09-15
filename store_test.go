@@ -209,7 +209,7 @@ func testStore(t *testing.T, new_stores newStoresFn) {
 		r, gm, err := s.Open(ctx, m.Digest)
 		x.NoError(err)
 		defer r.Close()
-		x.Eq(int64(0), gm.Size())
+		x.Eq(int64(0), mustSize(t, gm))
 
 		got, err := io.ReadAll(r)
 		x.NoError(err)
@@ -674,8 +674,8 @@ func TestWalkContract(t *testing.T) {
 					}
 					seen[info.Digest()] = true
 					labels, err := info.Labels(t.Context())
-					if err != nil || info.Size() != m.Size || labels.Get("Owner") != m.Labels.Get("Owner") {
-						t.Fatalf("Info mismatch: %s %d %v, %v", info.Digest(), info.Size(), labels, err)
+					if err != nil || mustSize(t, info) != m.Size || labels.Get("Owner") != m.Labels.Get("Owner") {
+						t.Fatalf("Info mismatch: %s %d %v, %v", info.Digest(), mustSize(t, info), labels, err)
 					}
 				}
 				if len(seen) != len(expected) {

@@ -34,7 +34,7 @@ func TestStat(t *testing.T) {
 					t.Fatal(err)
 				}
 				info, err := st.Stat(ctx, m.Digest)
-				if err != nil || info.Digest() != m.Digest || info.Size() != int64(len(content)) {
+				if err != nil || info.Digest() != m.Digest || mustSize(t, info) != int64(len(content)) {
 					t.Fatalf("Stat = %v, %v", info, err)
 				}
 				other := stores.Use("b")
@@ -82,7 +82,7 @@ func TestOsInfoDoesNotReadLabelsUntilRequested(t *testing.T) {
 		t.Fatalf("Open content = %q, %v", data, err)
 	}
 	for _, info := range []Info{info, opened} {
-		if info.Digest() != m.Digest || info.Size() != 5 {
+		if info.Digest() != m.Digest || mustSize(t, info) != 5 {
 			t.Fatalf("Info = %v", info)
 		}
 		if _, err := info.Labels(t.Context()); err == nil {
@@ -153,7 +153,7 @@ func TestCompositeStat(t *testing.T) {
 			for _, primary := range []Store{NewMemStores().Use("empty"), ErrorStore{Err: errors.New("unavailable")}} {
 				s := statTestWrapper{factory(primary, origin)}
 				info, err := s.Stat(t.Context(), m.Digest)
-				if err != nil || info.Size() != 5 {
+				if err != nil || mustSize(t, info) != 5 {
 					t.Fatalf("origin Stat = %v, %v", info, err)
 				}
 			}
@@ -165,7 +165,7 @@ func TestCompositeStat(t *testing.T) {
 					want = 9
 				}
 				info, err := s.Stat(t.Context(), m.Digest)
-				if err != nil || info.Size() != want {
+				if err != nil || mustSize(t, info) != want {
 					t.Fatalf("Stat fallback = %v, %v; want %d", info, err, want)
 				}
 			}
@@ -210,7 +210,7 @@ func TestS3StatReadsReferenceSize(t *testing.T) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		wantPath := "/bucket/refs/sha256/" + strings.TrimPrefix(string(d), "sha256:") + "/a"
+		wantPath := "/bucket/refs/a/sha256/" + strings.TrimPrefix(string(d), "sha256:")
 		if r.Method != http.MethodHead || r.URL.Path != wantPath {
 			t.Errorf("request = %s %s; want HEAD %s", r.Method, r.URL.Path, wantPath)
 		}
@@ -224,7 +224,7 @@ func TestS3StatReadsReferenceSize(t *testing.T) {
 	}
 	st := stores.Use("a")
 	info, err := st.Stat(t.Context(), d)
-	if err != nil || info.Size() != 5 || calls != 1 {
+	if err != nil || mustSize(t, info) != 5 || calls != 1 {
 		t.Fatalf("Stat = %v, %v (%d requests)", info, err, calls)
 	}
 }

@@ -6,7 +6,7 @@ package flob
 // Layout inside a single bucket:
 //
 //	<prefix>blob/<algo>/<hex>            the one shared copy of each blob (dedup)
-//	<prefix>refs/<algo>/<hex>/<store>   per-store reference marker; labels + size
+//	<prefix>refs/<store>/<algo>/<hex>   per-store reference marker; labels + size
 //	                                    are kept in the marker's x-amz-meta-* headers
 //
 // A blob is content-addressed, so identical content from any store resolves to
@@ -14,7 +14,9 @@ package flob
 // observable from a store only if that store's refs/ marker exists, and every
 // visibility decision (Stat/Open/Label/Add's dup check) reads the marker. Open
 // additionally checks the shared object's availability and representation.
-// Erase removes only the namespace reference.
+// Erase removes only the namespace reference. The store segment comes first so
+// one namespace's references share a listing prefix; point lookups build the
+// full key and do not depend on the order.
 
 import (
 	"bytes"
@@ -185,7 +187,12 @@ func (s *S3Stores) blobKey(d Digest) string {
 }
 
 func (s *S3Stores) refKey(d Digest, id string) string {
-	return s.prefix + "refs/" + d.Algorithm().String() + "/" + d.Encoded() + "/" + namespaceSegment(id)
+	return s.refPrefix(id) + d.Algorithm().String() + "/" + d.Encoded()
+}
+
+// refPrefix is the listing prefix that holds every reference of one namespace.
+func (s *S3Stores) refPrefix(id string) string {
+	return s.prefix + "refs/" + namespaceSegment(id) + "/"
 }
 
 // presignGet builds a presigned GET URL for an in-bucket key, valid for ttl. It
@@ -670,10 +677,12 @@ type s3ListPage struct {
 	IsTruncated           bool
 	NextContinuationToken string
 	Contents              []struct{ Key string }
+	CommonPrefixes        []struct{ Prefix string }
 }
 
-// refKeys lists reference objects without reading blob bodies or metadata.
-func (s *S3Stores) refKeys(ctx context.Context) iter.Seq2[string, error] {
+// listRefs lists reference keys under prefix without reading blob bodies or
+// metadata. With a delimiter, it also yields the rolled-up common prefixes.
+func (s *S3Stores) listRefs(ctx context.Context, prefix, delimiter string) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
 		token := ""
 		seen := map[string]bool{}
@@ -682,7 +691,10 @@ func (s *S3Stores) refKeys(ctx context.Context) iter.Seq2[string, error] {
 				yield("", err)
 				return
 			}
-			q := url.Values{"list-type": {"2"}, "prefix": {s.prefix + "refs/"}, "encoding-type": {"url"}}
+			q := url.Values{"list-type": {"2"}, "prefix": {prefix}, "encoding-type": {"url"}}
+			if delimiter != "" {
+				q.Set("delimiter", delimiter)
+			}
 			if token != "" {
 				q.Set("continuation-token", token)
 			}
@@ -713,12 +725,18 @@ func (s *S3Stores) refKeys(ctx context.Context) iter.Seq2[string, error] {
 				yield("", fmt.Errorf("unsupported list encoding %q", page.EncodingType))
 				return
 			}
+			names := make([]string, 0, len(page.Contents)+len(page.CommonPrefixes))
 			for _, obj := range page.Contents {
+				names = append(names, obj.Key)
+			}
+			for _, common := range page.CommonPrefixes {
+				names = append(names, common.Prefix)
+			}
+			for _, key := range names {
 				if err := ctx.Err(); err != nil {
 					yield("", err)
 					return
 				}
-				key := obj.Key
 				if page.EncodingType == "url" {
 					key, err = url.PathUnescape(key)
 					if err != nil {
@@ -756,56 +774,94 @@ func (s *S3Stores) parseRefKey(key string) (Digest, string, bool) {
 	if len(parts) != 3 {
 		return "", "", false
 	}
-	d, err := Digest(parts[0] + ":" + parts[1]).Sanitize()
-	if err != nil || string(d) != parts[0]+":"+parts[1] {
+	id, ok := refNamespace(parts[0])
+	if !ok {
 		return "", "", false
 	}
-	id, err := namespaceID(parts[2])
-	if err != nil || namespaceSegment(id) != parts[2] {
+	d, err := Digest(parts[1] + ":" + parts[2]).Sanitize()
+	if err != nil || string(d) != parts[1]+":"+parts[2] {
 		return "", "", false
 	}
 	return d, id, true
 }
 
+// refNamespace decodes a reference namespace segment, rejecting noncanonical
+// encodings that would alias another namespace.
+func refNamespace(segment string) (string, bool) {
+	id, err := namespaceID(segment)
+	return id, err == nil && namespaceSegment(id) == segment
+}
+
+// Walk lists only this namespace's reference prefix and issues no per-reference
+// request. Each Info issues one reference HEAD on its first Size or Labels call.
 func (s *S3Store) Walk(ctx context.Context) iter.Seq2[Info, error] {
 	return func(yield func(Info, error) bool) {
-		for key, err := range s.stores.refKeys(ctx) {
+		for key, err := range s.stores.listRefs(ctx, s.stores.refPrefix(s.id), "") {
 			if err != nil {
 				yield(nil, err)
 				return
 			}
-			d, id, ok := s.stores.parseRefKey(key)
-			if !ok || id != s.id {
+			d, _, ok := s.stores.parseRefKey(key)
+			if !ok {
 				continue
 			}
-			info, err := s.Stat(ctx, d)
-			if errors.Is(err, ErrNotExist) {
-				continue
-			}
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-			if !yield(info, nil) {
+			if !yield(s.lazyInfo(d), nil) {
 				return
 			}
 		}
 	}
 }
 
+// lazyInfo shares one successful Stat between size and labels. NewLazyInfo
+// serializes both loads, so stat needs no lock of its own.
+func (s *S3Store) lazyInfo(d Digest) Info {
+	var stat Info
+	load := func(ctx context.Context) (Info, error) {
+		if stat == nil {
+			info, err := s.Stat(ctx, d)
+			if err != nil {
+				return nil, err
+			}
+			stat = info
+		}
+		return stat, nil
+	}
+	return NewLazyInfo(d, func(ctx context.Context) (int64, error) {
+		info, err := load(ctx)
+		if err != nil {
+			return 0, err
+		}
+		return info.Size(ctx)
+	}, func(ctx context.Context) (Labels, error) {
+		info, err := load(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return info.Labels(ctx)
+	})
+}
+
+// Namespaces lists refs/ with a delimiter, reading one entry per namespace rather
+// than one per reference.
 func (s *S3Stores) Namespaces(ctx context.Context) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
-		seen := map[string]bool{}
-		for key, err := range s.refKeys(ctx) {
+		for prefix, err := range s.listRefs(ctx, s.prefix+"refs/", "/") {
 			if err != nil {
 				yield("", err)
 				return
 			}
-			_, id, ok := s.parseRefKey(key)
-			if !ok || seen[id] {
+			segment, ok := strings.CutPrefix(prefix, s.prefix+"refs/")
+			if !ok {
 				continue
 			}
-			seen[id] = true
+			// Objects directly under refs/ are not namespace prefixes.
+			if segment, ok = strings.CutSuffix(segment, "/"); !ok {
+				continue
+			}
+			id, ok := refNamespace(segment)
+			if !ok {
+				continue
+			}
 			if !yield(id, nil) {
 				return
 			}

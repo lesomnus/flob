@@ -170,7 +170,7 @@ func (m *mockS3) getOrHead(w http.ResponseWriter, r *http.Request, key string, b
 
 func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	prefix := q.Get("prefix")
+	prefix, delimiter := q.Get("prefix"), q.Get("delimiter")
 	maxKeys := 1000
 	if v := q.Get("max-keys"); v != "" {
 		if n, e := strconv.Atoi(v); e == nil {
@@ -179,9 +179,22 @@ func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Keys past the delimiter roll up into one common prefix, which pages like a key.
 	var keys []string
+	common := map[string]bool{}
 	for key := range m.objects {
-		if strings.HasPrefix(key, prefix) && key > q.Get("continuation-token") {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if i := strings.Index(key[len(prefix):], delimiter); delimiter != "" && i >= 0 {
+			rolled := key[:len(prefix)+i+len(delimiter)]
+			if common[rolled] {
+				continue
+			}
+			common[rolled] = true
+			key = rolled
+		}
+		if key > q.Get("continuation-token") {
 			keys = append(keys, key)
 		}
 	}
@@ -193,6 +206,7 @@ func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
 		IsTruncated                         bool
 		NextContinuationToken, EncodingType string
 		Contents                            []s3StageListedKey
+		CommonPrefixes                      []struct{ Prefix string }
 	}{Name: m.bucket, Prefix: prefix, MaxKeys: maxKeys, EncodingType: q.Get("encoding-type")}
 	if len(keys) > maxKeys {
 		page.IsTruncated = true
@@ -200,11 +214,15 @@ func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
 		page.NextContinuationToken = keys[len(keys)-1]
 	}
 	for _, key := range keys {
-		entry := s3StageListedKey{Key: key, LastModified: m.objects[key].modified}
+		name := key
 		if page.EncodingType == "url" {
-			entry.Key = url.PathEscape(key)
+			name = url.PathEscape(key)
 		}
-		page.Contents = append(page.Contents, entry)
+		if common[key] {
+			page.CommonPrefixes = append(page.CommonPrefixes, struct{ Prefix string }{name})
+			continue
+		}
+		page.Contents = append(page.Contents, s3StageListedKey{Key: name, LastModified: m.objects[key].modified})
 	}
 	page.KeyCount = len(keys)
 	w.Header().Set("Content-Type", "application/xml")
@@ -789,37 +807,49 @@ func walkS3Server(t *testing.T, handler http.HandlerFunc) *S3Stores {
 
 func TestS3WalkPages(t *testing.T) {
 	d := DigestFromBytes([]byte("hello"))
-	deleted := DigestFromBytes([]byte("deleted"))
-	ref := func(d Digest, id string) string {
-		return "refs/" + d.Algorithm().String() + "/" + d.Encoded() + "/" + namespaceSegment(id)
+	erased := DigestFromBytes([]byte("erased"))
+	ref := func(d Digest) string {
+		return "refs/~YS9i/" + d.Algorithm().String() + "/" + d.Encoded()
 	}
-	lists, heads := 0, 0
+	var lists []string
+	heads := 0
 	s := walkS3Server(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			lists++
-			if r.URL.Query().Get("list-type") != "2" || r.URL.Query().Get("encoding-type") != "url" {
+			q := r.URL.Query()
+			if q.Get("list-type") != "2" || q.Get("encoding-type") != "url" {
 				t.Error("not URL-encoded ListObjectsV2")
 			}
-			var keys []string
+			request := q.Get("prefix") + "|" + q.Get("delimiter") + "|" + q.Get("continuation-token")
+			lists = append(lists, request)
+			var keys, prefixes []string
 			next := ""
-			switch r.URL.Query().Get("continuation-token") {
-			case "":
-				keys = []string{ref(d, "other"), ref(deleted, "a/b"), "refs/sha256/bad/a", "refs/sha256/" + d.Encoded() + "/~YQ"}
+			switch request {
+			case "refs/~YS9i/||":
+				keys = []string{ref(d), "refs/~YS9i/sha256/bad", ref(d) + "/extra"}
 				next = "next+/=&"
-			case "next+/=&":
-				keys = []string{ref(d, "a/b")}
+			case "refs/~YS9i/||next+/=&":
+				keys = []string{ref(erased)}
+			case "refs/|/|":
+				keys = []string{"refs/stray"}
+				prefixes = []string{"refs/~YS9i/", "refs/other/", "refs/~YQ/"}
+				next = "next+/=&"
+			case "refs/|/|next+/=&":
+				prefixes = []string{"refs/~/"}
 			default:
-				t.Error("wrong token")
+				t.Errorf("unexpected list %q", request)
 			}
 			page := s3ListPage{EncodingType: "url", IsTruncated: next != "", NextContinuationToken: next}
 			for _, key := range keys {
 				page.Contents = append(page.Contents, struct{ Key string }{url.PathEscape(key)})
 			}
+			for _, prefix := range prefixes {
+				page.CommonPrefixes = append(page.CommonPrefixes, struct{ Prefix string }{url.PathEscape(prefix)})
+			}
 			xml.NewEncoder(w).Encode(page)
 		case http.MethodHead:
 			heads++
-			if strings.Contains(r.URL.Path, deleted.Encoded()) {
+			if strings.Contains(r.URL.Path, erased.Encoded()) {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
@@ -829,24 +859,31 @@ func TestS3WalkPages(t *testing.T) {
 			t.Errorf("unexpected blob I/O: %s %s", r.Method, r.URL)
 		}
 	})
-	count := 0
+	// The walk lists only its own namespace and skips malformed digest paths,
+	// without a HEAD per reference.
+	var infos []Info
 	for info, err := range s.Use("a/b").(*S3Store).Walk(t.Context()) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		count++
-		if info.Digest() != d || info.Size() != 5 {
-			t.Fatalf("Info = %v", info)
-		}
-		labels, err := info.Labels(t.Context())
-		if err != nil || labels.Get("owner") != "value" {
-			t.Fatalf("labels = %v, %v", labels, err)
-		}
+		infos = append(infos, info)
 	}
-	if count != 1 || lists != 2 || heads != 2 {
-		t.Fatalf("count/list/head = %d/%d/%d", count, lists, heads)
+	if len(infos) != 2 || infos[0].Digest() != d || infos[1].Digest() != erased || len(lists) != 2 || heads != 0 {
+		t.Fatalf("walk = %d entries, lists %q, %d heads", len(infos), lists, heads)
 	}
-	lists, heads = 0, 0
+	// Size and labels share one reference HEAD.
+	if size := mustSize(t, infos[0]); size != 5 {
+		t.Fatalf("size = %d", size)
+	}
+	labels, err := infos[0].Labels(t.Context())
+	if err != nil || labels.Get("owner") != "value" || heads != 1 {
+		t.Fatalf("labels = %v, %v (%d heads)", labels, err, heads)
+	}
+	// A reference erased after the listing is reported when used.
+	if _, err := infos[1].Size(t.Context()); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("erased size = %v", err)
+	}
+	lists, heads = nil, 0
 	got := map[string]bool{}
 	for id, err := range s.Namespaces(t.Context()) {
 		if err != nil {
@@ -854,14 +891,12 @@ func TestS3WalkPages(t *testing.T) {
 		}
 		got[id] = true
 	}
-	if len(got) != 2 || !got["a/b"] || !got["other"] || lists != 2 || heads != 0 {
-		t.Fatalf("namespaces %v list/head %d/%d", got, lists, heads)
+	if len(got) != 3 || !got["a/b"] || !got["other"] || !got[""] || len(lists) != 2 || heads != 0 {
+		t.Fatalf("namespaces %v, lists %q, %d heads", got, lists, heads)
 	}
 }
 
 func TestS3EnumerationStops(t *testing.T) {
-	d := DigestFromBytes([]byte("hello"))
-	key := "refs/sha256/" + d.Encoded() + "/a"
 	for _, mode := range []string{"break", "cancel", "missing-token", "repeated-token", "bad-xml", "http-error", "bad-escape"} {
 		t.Run(mode, func(t *testing.T) {
 			calls := 0
@@ -881,9 +916,9 @@ func TestS3EnumerationStops(t *testing.T) {
 				}
 				if mode == "bad-escape" {
 					page.EncodingType = "url"
-					page.Contents = append(page.Contents, struct{ Key string }{"%bad%"})
+					page.CommonPrefixes = append(page.CommonPrefixes, struct{ Prefix string }{"%bad%"})
 				} else {
-					page.Contents = append(page.Contents, struct{ Key string }{key})
+					page.CommonPrefixes = append(page.CommonPrefixes, struct{ Prefix string }{"refs/a/"})
 				}
 				xml.NewEncoder(w).Encode(page)
 			})
@@ -946,8 +981,8 @@ func TestS3StoreLazyRanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	if info.Size() != int64(len(content)) {
-		t.Fatalf("size = %d", info.Size())
+	if size := mustSize(t, info); size != int64(len(content)) {
+		t.Fatalf("size = %d", size)
 	}
 	reader.Seek(0, io.SeekEnd)
 	reader.Seek(0, io.SeekStart)

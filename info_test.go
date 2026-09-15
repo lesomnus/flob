@@ -15,7 +15,7 @@ func TestInfoLazyLabels(t *testing.T) {
 		calls++
 		return source, nil
 	})
-	if info.Digest() != d || info.Size() != 5 || calls != 0 {
+	if info.Digest() != d || mustSize(t, info) != 5 || calls != 0 {
 		t.Fatal("identity access loaded labels")
 	}
 	first, err := info.Labels(t.Context())
@@ -97,5 +97,63 @@ func TestInfoConcurrentLabels(t *testing.T) {
 	wg.Wait()
 	if calls != 1 {
 		t.Fatalf("loaded %d times", calls)
+	}
+}
+
+func mustSize(t *testing.T, info Info) int64 {
+	t.Helper()
+	size, err := info.Size(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return size
+}
+
+func TestLazyInfoLoadsSizeOnDemand(t *testing.T) {
+	d := DigestFromBytes([]byte("hello"))
+	sizes, labels := 0, 0
+	info := NewLazyInfo(d, func(context.Context) (int64, error) {
+		sizes++
+		if sizes == 1 {
+			return 0, errors.New("unavailable")
+		}
+		return 5, nil
+	}, func(context.Context) (Labels, error) {
+		labels++
+		return nil, nil
+	})
+	if info.Digest() != d || sizes != 0 || labels != 0 {
+		t.Fatal("construction loaded size or labels")
+	}
+	if _, err := info.Size(t.Context()); err == nil {
+		t.Fatal("size failure was hidden")
+	}
+	for range 2 {
+		if size := mustSize(t, info); size != 5 {
+			t.Fatalf("size = %d", size)
+		}
+	}
+	if sizes != 2 || labels != 0 {
+		t.Fatalf("loads = %d sizes, %d labels", sizes, labels)
+	}
+}
+
+func TestLazyInfoSerializesSizeAndLabels(t *testing.T) {
+	shared := 0 // A race is a test failure if the two loaders run concurrently.
+	info := NewLazyInfo("", func(context.Context) (int64, error) {
+		shared++
+		return int64(shared), nil
+	}, func(context.Context) (Labels, error) {
+		shared++
+		return nil, nil
+	})
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Go(func() { info.Size(t.Context()) })
+		wg.Go(func() { info.Labels(t.Context()) })
+	}
+	wg.Wait()
+	if shared != 2 {
+		t.Fatalf("loaded %d times", shared)
 	}
 }
