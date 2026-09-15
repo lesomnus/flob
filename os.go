@@ -229,12 +229,26 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	if err := os.MkdirAll(filepath.Dir(pr), 0o755); err != nil {
 		return m, fmt.Errorf("mkdir repo: %w", err)
 	}
+	if err := stampEntry(ps); err != nil {
+		return m, err
+	}
 	if err := s.moveStageToRepo(ps, pr); err != nil {
 		return m, err
 	}
 
 	ok = true
 	return m, nil
+}
+
+// stampEntry records the publication time on a staged digest directory just before
+// it is moved into a repo, for [Info.Added]. Its modification time otherwise dates
+// from creating the entries inside it, which can precede a long copy.
+func stampEntry(dir string) error {
+	now := time.Now()
+	if err := os.Chtimes(dir, now, now); err != nil {
+		return fmt.Errorf("stamp entry: %w", err)
+	}
+	return nil
 }
 
 // moveStageToRepo atomically moves the fully-staged directory ps onto the repo digest
@@ -429,7 +443,8 @@ func (s OsStore) open(_ context.Context, d Digest) (string, Info, error) {
 		}
 		return "", nil, fmt.Errorf("stat: %w", err)
 	}
-	info := NewInfo(d, fi.Size(), func(ctx context.Context) (Labels, error) {
+	size := fi.Size()
+	info := NewLazyInfo(d, func(context.Context) (int64, error) { return size, nil }, s.added(d), func(ctx context.Context) (Labels, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -448,6 +463,25 @@ func (s OsStore) open(_ context.Context, d Digest) (string, Info, error) {
 		return labels, nil
 	})
 	return pb, info, nil
+}
+
+// added reads the digest directory's modification time. Add, Link, and staged
+// commits stamp it when publishing, and Label's rename of the labels file into it
+// updates it.
+func (s OsStore) added(d Digest) func(context.Context) (time.Time, error) {
+	return func(ctx context.Context) (time.Time, error) {
+		if err := ctx.Err(); err != nil {
+			return time.Time{}, err
+		}
+		fi, err := os.Stat(s.pathToRepo(d))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return time.Time{}, ErrNotExist
+			}
+			return time.Time{}, fmt.Errorf("stat entry: %w", err)
+		}
+		return fi.ModTime(), nil
+	}
 }
 
 // checkDup checks if the blob with the given path already exists.
@@ -626,6 +660,9 @@ func (s OsStore) Link(ctx context.Context, d Digest, from Store) (Meta, error) {
 	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 		return m, fmt.Errorf("mkdir destination: %w", err)
 	}
+	if err := stampEntry(stage); err != nil {
+		return m, err
+	}
 	if err := s.moveStageToRepo(stage, destination); err != nil {
 		return m, err
 	}
@@ -682,7 +719,7 @@ func (s OsStore) Walk(ctx context.Context) iter.Seq2[Info, error] {
 					return 0, err
 				}
 				return current.Size(ctx)
-			}, func(ctx context.Context) (Labels, error) {
+			}, s.added(d), func(ctx context.Context) (Labels, error) {
 				current, err := s.Stat(ctx, d)
 				if err != nil {
 					return nil, err
@@ -1365,6 +1402,11 @@ func (s *osStage) recoverCommit(l *osLockedStage) (Meta, error) {
 				return Meta{}, err
 			}
 		} else if !errors.Is(err, fs.ErrNotExist) {
+			return Meta{}, err
+		}
+		// Stamp the publication time for Info.Added; see stampEntry.
+		now := time.Now()
+		if err := l.root.Chtimes(publish, now, now); err != nil {
 			return Meta{}, err
 		}
 		if err := l.root.Rename(publish, destination); err != nil {

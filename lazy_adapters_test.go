@@ -46,7 +46,7 @@ func TestHttpLazyLabelsFailure(t *testing.T) {
 			const content = "content"
 			d := DigestFromBytes([]byte(content))
 			body := &closeRecordingReader{Reader: strings.NewReader(content)}
-			info := NewInfo(d, int64(len(content)), func(context.Context) (Labels, error) { return nil, errors.New("labels unavailable") })
+			info := NewInfo(d, int64(len(content)), time.Time{}, func(context.Context) (Labels, error) { return nil, errors.New("labels unavailable") })
 			handler := HttpHandler{Stores: FixedStores{Store: lazyAdapterStore{info: info, body: body}}}
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, httptest.NewRequest(method, "/t/"+string(d), nil))
@@ -67,7 +67,7 @@ func TestCacheLazyLabelsFailureStillStreams(t *testing.T) {
 	const content = "content"
 	d := DigestFromBytes([]byte(content))
 	labelsCalled := make(chan struct{})
-	info := NewInfo(d, int64(len(content)), func(context.Context) (Labels, error) {
+	info := NewInfo(d, int64(len(content)), time.Time{}, func(context.Context) (Labels, error) {
 		close(labelsCalled)
 		return nil, errors.New("labels unavailable")
 	})
@@ -105,7 +105,7 @@ func TestCacheLazyLabelsFailureStillStreams(t *testing.T) {
 func TestCheckExistenceDoesNotLoadLabels(t *testing.T) {
 	d := DigestFromBytes([]byte("content"))
 	var calls atomic.Int32
-	info := NewInfo(d, 7, func(context.Context) (Labels, error) { calls.Add(1); return nil, errors.New("labels unavailable") })
+	info := NewInfo(d, 7, time.Time{}, func(context.Context) (Labels, error) { calls.Add(1); return nil, errors.New("labels unavailable") })
 	store := CheckExistence(lazyAdapterStore{info: info})
 	m, err := store.Add(t.Context(), Meta{Digest: d}, strings.NewReader("content"))
 	if !errors.Is(err, ErrAlreadyExists) {
@@ -116,5 +116,71 @@ func TestCheckExistenceDoesNotLoadLabels(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatal("duplicate check loaded labels")
+	}
+}
+
+func TestHttpLastModified(t *testing.T) {
+	stores := NewMemStores()
+	m, err := stores.Use("t").Add(t.Context(), Meta{}, strings.NewReader("content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := stores.Use("t").Stat(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	added, err := local.Added(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(HttpHandler{Stores: stores})
+	defer server.Close()
+	response, err := server.Client().Get(server.URL + "/t/" + string(m.Digest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if got := response.Header.Get("Last-Modified"); got != added.UTC().Format(http.TimeFormat) {
+		t.Fatalf("GET Last-Modified = %q", got)
+	}
+	remote := HttpStores{Client: server.Client(), Target: server.URL}.Use("t")
+	stat, err := remote.Stat(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, opened, err := remote.Open(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	// HTTP dates carry whole seconds.
+	for _, info := range []Info{stat, opened} {
+		if got, err := info.Added(t.Context()); err != nil || !got.Equal(added.Truncate(time.Second)) {
+			t.Fatalf("remote Added = %v, %v; want %v", got, err, added.Truncate(time.Second))
+		}
+	}
+
+	d := DigestFromBytes([]byte("content"))
+	unknown := HttpHandler{Stores: FixedStores{Store: lazyAdapterStore{info: NewInfo(d, 7, time.Time{}, nil)}}}
+	recorder := httptest.NewRecorder()
+	unknown.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/t/"+string(d), nil))
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Last-Modified") != "" {
+		t.Fatalf("unknown time: %d %v", recorder.Code, recorder.Header())
+	}
+	unknownServer := httptest.NewServer(unknown)
+	defer unknownServer.Close()
+	info, err := HttpStores{Client: unknownServer.Client(), Target: unknownServer.URL}.Use("t").Stat(t.Context(), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := info.Added(t.Context()); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("remote unknown Added = %v", err)
+	}
+
+	failing := NewLazyInfo(d, nil, func(context.Context) (time.Time, error) { return time.Time{}, errors.New("stat failed") }, nil)
+	recorder = httptest.NewRecorder()
+	HttpHandler{Stores: FixedStores{Store: lazyAdapterStore{info: failing}}}.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/t/"+string(d), nil))
+	if recorder.Code != http.StatusInternalServerError || recorder.Header().Get("ETag") != "" || recorder.Header().Get("Last-Modified") != "" {
+		t.Fatalf("failed time: %d %v", recorder.Code, recorder.Header())
 	}
 }

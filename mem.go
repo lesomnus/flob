@@ -11,6 +11,7 @@ import (
 	"iter"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -117,6 +118,7 @@ func (s *MemStore) publish(m Meta, data []byte) (Meta, error) {
 	defer b.mu.Unlock()
 
 	e := &memEntry{blob: b}
+	e.added.Store(time.Now().UnixNano())
 	if m.Labels != nil {
 		ls := cloneLabels(m.Labels)
 		e.labels.Store(&ls)
@@ -150,7 +152,7 @@ func (s *MemStore) open(d Digest) (*memEntry, Info, error) {
 		return nil, nil, ErrNotExist
 	}
 	entry := v.(*memEntry)
-	info := NewInfo(d, int64(len(entry.blob.data)), func(ctx context.Context) (Labels, error) {
+	info := NewInfo(d, int64(len(entry.blob.data)), time.Unix(0, entry.added.Load()), func(ctx context.Context) (Labels, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -178,6 +180,7 @@ func (s *MemStore) Label(ctx context.Context, d Digest, labels Labels) error {
 	entry := v.(*memEntry)
 	ls := cloneLabels(labels)
 	entry.labels.Store(&ls)
+	entry.added.Store(time.Now().UnixNano())
 
 	return nil
 }
@@ -219,6 +222,7 @@ func (b *memBlob) Inc() {
 type memEntry struct {
 	blob   *memBlob
 	labels atomic.Pointer[Labels]
+	added  atomic.Int64 // Unix nanoseconds of the last publish, link, or label update.
 }
 
 type nopCloser struct{ *bytes.Reader }
@@ -264,6 +268,7 @@ func (s *MemStore) Link(ctx context.Context, d Digest, from Store) (Meta, error)
 		m.Labels = cloneLabels(*labels)
 	}
 	e := &memEntry{blob: b}
+	e.added.Store(time.Now().UnixNano())
 	if m.Labels != nil {
 		labels := cloneLabels(m.Labels)
 		e.labels.Store(&labels)
@@ -293,7 +298,7 @@ func (s *MemStore) Walk(ctx context.Context) iter.Seq2[Info, error] {
 				return false
 			}
 			entry := value.(*memEntry)
-			info := NewInfo(key.(Digest), int64(len(entry.blob.data)), func(ctx context.Context) (Labels, error) {
+			info := NewInfo(key.(Digest), int64(len(entry.blob.data)), time.Unix(0, entry.added.Load()), func(ctx context.Context) (Labels, error) {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}

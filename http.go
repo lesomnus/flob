@@ -109,11 +109,18 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		m, err := infoMeta(r.Context(), info)
+		var modified string
+		if err == nil {
+			modified, err = lastModified(r.Context(), info)
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		h.setMetaHeaders(w, m)
+		if modified != "" {
+			w.Header().Set("Last-Modified", modified)
+		}
 		w.WriteHeader(http.StatusOK)
 
 	case http.MethodGet:
@@ -152,11 +159,18 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer rc.Close()
 		m, err := infoMeta(r.Context(), info)
+		var modified string
+		if err == nil {
+			modified, err = lastModified(r.Context(), info)
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		h.setMetaHeaders(w, m)
+		if modified != "" {
+			w.Header().Set("Last-Modified", modified)
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		http.ServeContent(w, r, "", time.Time{}, rc)
 
@@ -234,6 +248,26 @@ func (h *HttpHandler) setMetaHeaders(w http.ResponseWriter, m Meta) {
 	}
 }
 
+// lastModified formats [Info.Added] for the Last-Modified header, or returns ""
+// when the store does not know when the blob was added.
+func lastModified(ctx context.Context, info Info) (string, error) {
+	added, err := info.Added(ctx)
+	if errors.Is(err, errors.ErrUnsupported) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return added.UTC().Format(http.TimeFormat), nil
+}
+
+// parseLastModified reads a Last-Modified header as the time a blob was added.
+// HTTP dates have second precision; a missing or malformed header is unknown.
+func parseLastModified(h http.Header) time.Time {
+	added, _ := http.ParseTime(h.Get("Last-Modified"))
+	return added
+}
+
 // HttpStores is an HTTP client for [HttpHandler] server.
 type HttpStores struct {
 	Client *http.Client
@@ -308,7 +342,7 @@ func (s HttpStore) Stat(ctx context.Context, d Digest) (Info, error) {
 		return nil, err
 	}
 	m := s.parseMeta(resp)
-	return NewInfo(m.Digest, m.Size, func(context.Context) (Labels, error) { return m.Labels, nil }), nil
+	return NewInfo(m.Digest, m.Size, parseLastModified(resp.Header), func(context.Context) (Labels, error) { return m.Labels, nil }), nil
 }
 
 // Open retrieves metadata with HEAD and streams content lazily through ranged
@@ -345,7 +379,7 @@ func (s HttpStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info,
 			}
 			return s.client.Do(req)
 		})
-	return reader, NewInfo(m.Digest, m.Size, func(context.Context) (Labels, error) { return m.Labels, nil }), nil
+	return reader, NewInfo(m.Digest, m.Size, parseLastModified(resp.Header), func(context.Context) (Labels, error) { return m.Labels, nil }), nil
 }
 
 func (s HttpStore) Label(ctx context.Context, d Digest, labels Labels) error {

@@ -809,6 +809,105 @@ func TestEnumerationCancellation(t *testing.T) {
 	}
 }
 
+func TestAddedContract(t *testing.T) {
+	added := func(t *testing.T, info Info) time.Time {
+		t.Helper()
+		at, err := info.Added(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	walked := func(t *testing.T, store Store, d Digest) time.Time {
+		t.Helper()
+		walker, _ := AsWalker(store)
+		for info, err := range walker.Walk(t.Context()) {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Digest() == d {
+				return added(t, info)
+			}
+		}
+		t.Fatalf("walk missed %s", d)
+		return time.Time{}
+	}
+	within := func(t *testing.T, what string, at, before, after time.Time) {
+		t.Helper()
+		// S3 reports whole seconds through HEAD.
+		if at.Before(before.Truncate(time.Second)) || at.After(after) {
+			t.Fatalf("%s Added = %v; want within [%v, %v]", what, at, before, after)
+		}
+	}
+	for name, factory := range walkTestFactories() {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			stores := factory(t)
+			source := stores.Use("source")
+			before := time.Now()
+			m, err := source.Add(ctx, Meta{}, strings.NewReader("content"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			after := time.Now()
+			info, err := source.Stat(ctx, m.Digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			within(t, "Stat", added(t, info), before, after)
+			reader, opened, err := source.Open(ctx, m.Digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader.Close()
+			within(t, "Open", added(t, opened), before, after)
+			first := walked(t, source, m.Digest)
+			within(t, "Walk", first, before, after)
+
+			// A duplicate Add keeps the time; Label advances it.
+			time.Sleep(20 * time.Millisecond)
+			if _, err := source.Add(ctx, Meta{}, strings.NewReader("content")); !errors.Is(err, ErrAlreadyExists) {
+				t.Fatalf("duplicate Add = %v", err)
+			}
+			if got := walked(t, source, m.Digest); !got.Equal(first) {
+				t.Fatalf("duplicate Add moved Added from %v to %v", first, got)
+			}
+			if err := source.Label(ctx, m.Digest, Labels{"Version": {"2"}}); err != nil {
+				t.Fatal(err)
+			}
+			if got := walked(t, source, m.Digest); !got.After(first) || got.After(time.Now()) {
+				t.Fatalf("Label Added = %v; previous %v", got, first)
+			}
+
+			linked := stores.Use("linked")
+			before = time.Now()
+			if _, err := requireLinker(t, linked).Link(ctx, m.Digest, source); err != nil {
+				t.Fatal(err)
+			}
+			within(t, "Link", walked(t, linked, m.Digest), before, time.Now())
+
+			staged := stores.Use("staged")
+			stager, ok := AsStager(staged)
+			if !ok {
+				t.Fatal("missing Stager")
+			}
+			stage, err := stager.Begin(ctx, Canonical)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stage.Append(ctx, 0, strings.NewReader("staged")); err != nil {
+				t.Fatal(err)
+			}
+			before = time.Now()
+			committed, err := stage.Commit(ctx, Meta{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			within(t, "Commit", walked(t, staged, committed.Digest), before, time.Now())
+		})
+	}
+}
+
 type walkStoreWrapper struct{ Store }
 
 func (s walkStoreWrapper) Unwrap() Store { return s.Store }

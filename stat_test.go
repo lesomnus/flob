@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStat(t *testing.T) {
@@ -135,7 +136,7 @@ func (s fixedStatStore) Stat(_ context.Context, d Digest) (Info, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	return NewInfo(d, s.size, nil), nil
+	return NewInfo(d, s.size, time.Time{}, nil), nil
 }
 
 func TestCompositeStat(t *testing.T) {

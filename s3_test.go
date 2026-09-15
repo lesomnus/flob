@@ -165,6 +165,7 @@ func (m *mockS3) getOrHead(w http.ResponseWriter, r *http.Request, key string, b
 	}
 	h.Set("ETag", fmt.Sprintf(`"%x"`, sha256.Sum256(obj.data)))
 	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Last-Modified", obj.modified.UTC().Format(http.TimeFormat))
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(obj.data))
 }
 
@@ -205,7 +206,7 @@ func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
 		KeyCount, MaxKeys                   int
 		IsTruncated                         bool
 		NextContinuationToken, EncodingType string
-		Contents                            []s3StageListedKey
+		Contents                            []s3ListedKey
 		CommonPrefixes                      []struct{ Prefix string }
 	}{Name: m.bucket, Prefix: prefix, MaxKeys: maxKeys, EncodingType: q.Get("encoding-type")}
 	if len(keys) > maxKeys {
@@ -222,7 +223,7 @@ func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
 			page.CommonPrefixes = append(page.CommonPrefixes, struct{ Prefix string }{name})
 			continue
 		}
-		page.Contents = append(page.Contents, s3StageListedKey{Key: name, LastModified: m.objects[key].modified})
+		page.Contents = append(page.Contents, s3ListedKey{Key: name, LastModified: m.objects[key].modified})
 	}
 	page.KeyCount = len(keys)
 	w.Header().Set("Content-Type", "application/xml")
@@ -808,6 +809,7 @@ func walkS3Server(t *testing.T, handler http.HandlerFunc) *S3Stores {
 func TestS3WalkPages(t *testing.T) {
 	d := DigestFromBytes([]byte("hello"))
 	erased := DigestFromBytes([]byte("erased"))
+	listed := time.Date(2026, 9, 15, 12, 0, 0, 123e6, time.UTC)
 	ref := func(d Digest) string {
 		return "refs/~YS9i/" + d.Algorithm().String() + "/" + d.Encoded()
 	}
@@ -841,7 +843,7 @@ func TestS3WalkPages(t *testing.T) {
 			}
 			page := s3ListPage{EncodingType: "url", IsTruncated: next != "", NextContinuationToken: next}
 			for _, key := range keys {
-				page.Contents = append(page.Contents, struct{ Key string }{url.PathEscape(key)})
+				page.Contents = append(page.Contents, s3ListedKey{Key: url.PathEscape(key), LastModified: listed})
 			}
 			for _, prefix := range prefixes {
 				page.CommonPrefixes = append(page.CommonPrefixes, struct{ Prefix string }{url.PathEscape(prefix)})
@@ -870,6 +872,10 @@ func TestS3WalkPages(t *testing.T) {
 	}
 	if len(infos) != 2 || infos[0].Digest() != d || infos[1].Digest() != erased || len(lists) != 2 || heads != 0 {
 		t.Fatalf("walk = %d entries, lists %q, %d heads", len(infos), lists, heads)
+	}
+	// The listing's time needs no HEAD.
+	if added, err := infos[0].Added(t.Context()); err != nil || !added.Equal(listed) || heads != 0 {
+		t.Fatalf("listed Added = %v, %v (%d heads)", added, err, heads)
 	}
 	// Size and labels share one reference HEAD.
 	if size := mustSize(t, infos[0]); size != 5 {

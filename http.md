@@ -22,9 +22,16 @@ A digest is a 64-character lowercase hex-encoded SHA-256 string.
 Blob metadata is conveyed through standard HTTP headers:
 
 ```
-ETag: "<digest>"    SHA-256 digest of the blob (quoted per RFC 7232)
-Content-Length: N   Size of the blob in bytes
+ETag: "<digest>"       SHA-256 digest of the blob (quoted per RFC 7232)
+Content-Length: N      Size of the blob in bytes
+Last-Modified: <date>  When the store last created or changed its entry
 ```
+
+`HEAD` and streamed `GET` responses include `Last-Modified` from `Info.Added` when
+the store knows the time; upload responses and presigned redirects do not. If
+loading the time fails, the server responds `500`, as for a label-loading
+failure. `HttpStore` reports the header through `Info.Added` in whole seconds and
+returns `errors.ErrUnsupported` when it is absent.
 
 Labels in requests (POST, PATCH) use a `Flob-` prefix to avoid collision with standard HTTP headers.
 In responses, labels are returned without the prefix as plain headers.
@@ -117,6 +124,7 @@ Success response (`200 OK`):
 HTTP/1.1 200 OK
 ETag: "3b4c..."
 Content-Length: 1234
+Last-Modified: Tue, 15 Sep 2026 12:00:00 GMT
 Foo: bar
 ```
 
@@ -170,6 +178,7 @@ Success response (`200 OK`):
 HTTP/1.1 200 OK
 ETag: "3b4c..."
 Content-Length: 1234
+Last-Modified: Tue, 15 Sep 2026 12:00:00 GMT
 Foo: bar
 
 <blob content>
