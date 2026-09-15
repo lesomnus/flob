@@ -62,8 +62,12 @@ or failed fill releases waiters to fetch from the origin themselves.
 
 Cache writes are best-effort. Read the entire blob and close its reader to allow
 caching to finish. Size probes and rereads of a prefix are supported; incomplete
-reads and reads that skip a gap abort the fill. Leader cancellation also releases
-waiters and closes its source reader. Backends must honor operation contexts and
+reads and reads that skip a gap abort the fill. Leader cancellation before the
+last byte also releases waiters and closes its source reader. Once every byte has
+been read, the write no longer depends on the reader or the `Open` context, so it
+finishes even after an HTTP handler returns and `net/http` cancels the request.
+`FillTimeout` bounds that remaining write (default 15 minutes), and waiters keep
+waiting for it. Backends must honor operation contexts and
 allow `Close` to interrupt outstanding reads.
 
 `CacheStores` and `CacheStore` now implement their interfaces as pointers.

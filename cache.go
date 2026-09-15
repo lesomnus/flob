@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -22,7 +23,10 @@ var (
 type CacheStores struct {
 	Primary Stores
 	Origin  Stores
-	flights cacheFlights
+	// FillTimeout bounds each cache write after its reader has delivered every
+	// byte. Nonpositive uses [DefaultCacheFillTimeout].
+	FillTimeout time.Duration
+	flights     cacheFlights
 }
 
 // Unwrap exposes the primary pool's optional inventory capabilities.
@@ -30,22 +34,30 @@ func (s *CacheStores) Unwrap() Stores { return s.Primary }
 
 func (s *CacheStores) Use(id string) Store {
 	return &CacheStore{
-		Primary:   s.Primary.Use(id),
-		Origin:    s.Origin.Use(id),
-		shared:    &s.flights,
-		namespace: id,
+		Primary:     s.Primary.Use(id),
+		Origin:      s.Origin.Use(id),
+		FillTimeout: s.FillTimeout,
+		shared:      &s.flights,
+		namespace:   id,
 	}
 }
 
 // CacheStore is a per-namespace cache. It must not be copied after first use,
 // and Primary and Origin must not be changed after first use.
 type CacheStore struct {
-	Primary   Store
-	Origin    Store
-	shared    *cacheFlights
-	namespace string
-	local     cacheFlights
+	Primary Store
+	Origin  Store
+	// FillTimeout bounds a cache write after its reader has delivered every byte.
+	// Nonpositive uses [DefaultCacheFillTimeout].
+	FillTimeout time.Duration
+	shared      *cacheFlights
+	namespace   string
+	local       cacheFlights
 }
+
+// DefaultCacheFillTimeout bounds a cache write that outlives its reader when
+// FillTimeout is unset.
+const DefaultCacheFillTimeout = 15 * time.Minute
 
 // Unwrap exposes the primary store's optional capabilities.
 func (s *CacheStore) Unwrap() Store { return s.Primary }
@@ -116,9 +128,12 @@ func (f *cacheFlights) finish(key cacheFlightKey, flight *cacheFlight, err error
 // a waiter tries the origin once itself; ordinary origin Open errors are shared.
 //
 // Caching completes when all bytes have been read in order. Size probes and
-// rereads of an already-read prefix are supported; reading past a gap or closing
-// early cancels the cache write and releases waiters. Writes remain best-effort
-// and may finish after the leading reader closes. Callers must close the reader.
+// rereads of an already-read prefix are supported; reading past a gap, closing
+// early, or canceling ctx before the last byte cancels the cache write and
+// releases waiters. Once every byte has been read, the write no longer depends on
+// the reader or ctx: it may finish after the reader closes and ctx is canceled,
+// as when an HTTP handler returns, within FillTimeout, and waiters keep waiting
+// for it. Writes remain best-effort. Callers must close the reader.
 func (s *CacheStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -168,7 +183,9 @@ func (s *CacheStore) openOrigin(ctx context.Context, d Digest, finish func(error
 	}
 	// Release waiters even if an origin operation has not returned on cancellation.
 	stopFlightCancellation := context.AfterFunc(ctx, func() { finish(nil) })
-	fillCtx, cancelFill := context.WithCancel(ctx)
+	// The fill keeps ctx's values but not its cancellation: ctx aborts it only while
+	// bytes are still flowing (see stopSourceCancellation).
+	fillCtx, cancelFill := context.WithCancel(context.WithoutCancel(ctx))
 	r, info, err := s.Origin.Open(ctx, d)
 	var size int64
 	if err == nil {
@@ -192,16 +209,41 @@ func (s *CacheStore) openOrigin(ctx context.Context, d Digest, finish func(error
 		sink.CloseWithError(err)
 		finish(nil)
 	}
+	fillDone := make(chan struct{})
+	timeout := s.FillTimeout
+	if timeout <= 0 {
+		timeout = DefaultCacheFillTimeout
+	}
+	complete := func() {
+		// Every byte reached the cache. Its write no longer depends on the reader or
+		// ctx, and waiters keep waiting for it, but it must finish within timeout.
+		stopFlightCancellation()
+		go func() {
+			select {
+			case <-fillDone:
+			case <-time.After(timeout):
+				cancelFill()
+			}
+		}()
+	}
 	tap.onAbort = abort
+	tap.onComplete = complete
 	if size < 0 {
 		abort(io.ErrUnexpectedEOF)
 	}
+	if size == 0 {
+		// newBlobTap completed the empty blob before the hooks were set.
+		complete()
+	}
 	stopSourceCancellation := context.AfterFunc(ctx, func() {
-		// Release the flight and any blocked pipe write before closing the source.
-		abort(ctx.Err())
+		// Abort a fill that is still receiving bytes, releasing the flight and any
+		// blocked pipe write, then close the source. Stopping the tap either aborts
+		// or finds it complete, so a fill that received every byte is left alone.
+		tap.stop(ctx.Err())
 		tap.Close()
 	})
 	go func() {
+		defer close(fillDone)
 		meta, err := infoMeta(fillCtx, info)
 		if err == nil && fillCtx.Err() == nil {
 			s.Primary.Add(fillCtx, meta, sink)
@@ -239,16 +281,17 @@ func (s *CacheStore) Erase(ctx context.Context, d Digest) error {
 }
 
 type blobTap struct {
-	w         *io.PipeWriter
-	r         io.ReadSeekCloser
-	offset    int64 // Current source position.
-	forwarded int64 // Contiguous prefix already sent to the cache.
-	size      int64
-	stopped   atomic.Bool
-	stopOnce  sync.Once
-	closeOnce sync.Once
-	closeErr  error
-	onAbort   func(error)
+	w          *io.PipeWriter
+	r          io.ReadSeekCloser
+	offset     int64 // Current source position.
+	forwarded  int64 // Contiguous prefix already sent to the cache.
+	size       int64
+	stopped    atomic.Bool
+	stopOnce   sync.Once
+	closeOnce  sync.Once
+	closeErr   error
+	onAbort    func(error)
+	onComplete func() // Called once the cache received every byte.
 }
 
 func newBlobTap(src io.ReadSeekCloser, size int64) (*blobTap, *io.PipeReader) {
@@ -332,6 +375,9 @@ func (t *blobTap) stop(err error) {
 		t.w.CloseWithError(err)
 		if err != nil && t.onAbort != nil {
 			t.onAbort(err)
+		}
+		if err == nil && t.onComplete != nil {
+			t.onComplete()
 		}
 	})
 }
