@@ -1,5 +1,5 @@
 {
-	"name": "lesomnus.flob",
+	"name": "lesomnus/flob",
 	"dockerComposeFile": "docker-compose.yaml",
 	"service": "dev",
 	"workspaceFolder": "/workspace",
