@@ -430,7 +430,7 @@ func (s *S3Store) Stat(ctx context.Context, d Digest) (Info, error) {
 	defer res.Body.Close()
 
 	labels, size := metaToLabels(res.Header)
-	return NewInfo(d, size, func(context.Context) (Labels, error) { return labels, nil }), nil
+	return NewInfo(d, size, parseLastModified(res.Header), func(context.Context) (Labels, error) { return labels, nil }), nil
 }
 
 func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
@@ -445,6 +445,7 @@ func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, 
 		return nil, nil, err
 	}
 	labels, size := metaToLabels(hres.Header)
+	added := parseLastModified(hres.Header)
 	hres.Body.Close()
 
 	// The reference authorizes access; a separate blob HEAD preserves Open's
@@ -471,7 +472,7 @@ func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, 
 			}
 			return s.stores.send(req, emptyPayloadHash)
 		})
-	return reader, NewInfo(d, size, func(context.Context) (Labels, error) { return labels, nil }), nil
+	return reader, NewInfo(d, size, added, func(context.Context) (Labels, error) { return labels, nil }), nil
 }
 
 // PresignOpen implements [Presigner]: it returns a short-lived direct download
@@ -676,19 +677,20 @@ type s3ListPage struct {
 	EncodingType          string
 	IsTruncated           bool
 	NextContinuationToken string
-	Contents              []struct{ Key string }
+	Contents              []s3ListedKey
 	CommonPrefixes        []struct{ Prefix string }
 }
 
-// listRefs lists reference keys under prefix without reading blob bodies or
-// metadata. With a delimiter, it also yields the rolled-up common prefixes.
-func (s *S3Stores) listRefs(ctx context.Context, prefix, delimiter string) iter.Seq2[string, error] {
-	return func(yield func(string, error) bool) {
+// listRefs lists reference keys and their modification times under prefix without
+// reading blob bodies or metadata. With a delimiter, it also yields the rolled-up
+// common prefixes, which have no time.
+func (s *S3Stores) listRefs(ctx context.Context, prefix, delimiter string) iter.Seq2[s3ListedKey, error] {
+	return func(yield func(s3ListedKey, error) bool) {
 		token := ""
 		seen := map[string]bool{}
 		for {
 			if err := ctx.Err(); err != nil {
-				yield("", err)
+				yield(s3ListedKey{}, err)
 				return
 			}
 			q := url.Values{"list-type": {"2"}, "prefix": {prefix}, "encoding-type": {"url"}}
@@ -700,55 +702,52 @@ func (s *S3Stores) listRefs(ctx context.Context, prefix, delimiter string) iter.
 			}
 			req, err := s.newRequest(ctx, http.MethodGet, "", q, nil)
 			if err != nil {
-				yield("", err)
+				yield(s3ListedKey{}, err)
 				return
 			}
 			res, err := s.send(req, emptyPayloadHash)
 			if err != nil {
-				yield("", err)
+				yield(s3ListedKey{}, err)
 				return
 			}
 			if res.StatusCode != http.StatusOK {
 				err = statusError("list refs", res)
 				res.Body.Close()
-				yield("", err)
+				yield(s3ListedKey{}, err)
 				return
 			}
 			var page s3ListPage
 			err = xml.NewDecoder(res.Body).Decode(&page)
 			res.Body.Close()
 			if err != nil {
-				yield("", fmt.Errorf("decode list refs: %w", err))
+				yield(s3ListedKey{}, fmt.Errorf("decode list refs: %w", err))
 				return
 			}
 			if page.EncodingType != "" && page.EncodingType != "url" {
-				yield("", fmt.Errorf("unsupported list encoding %q", page.EncodingType))
+				yield(s3ListedKey{}, fmt.Errorf("unsupported list encoding %q", page.EncodingType))
 				return
 			}
-			names := make([]string, 0, len(page.Contents)+len(page.CommonPrefixes))
-			for _, obj := range page.Contents {
-				names = append(names, obj.Key)
-			}
+			entries := page.Contents
 			for _, common := range page.CommonPrefixes {
-				names = append(names, common.Prefix)
+				entries = append(entries, s3ListedKey{Key: common.Prefix})
 			}
-			for _, key := range names {
+			for _, entry := range entries {
 				if err := ctx.Err(); err != nil {
-					yield("", err)
+					yield(s3ListedKey{}, err)
 					return
 				}
 				if page.EncodingType == "url" {
-					key, err = url.PathUnescape(key)
+					entry.Key, err = url.PathUnescape(entry.Key)
 					if err != nil {
-						yield("", fmt.Errorf("decode ref key: %w", err))
+						yield(s3ListedKey{}, fmt.Errorf("decode ref key: %w", err))
 						return
 					}
 				}
-				if !yield(key, nil) {
+				if !yield(entry, nil) {
 					return
 				}
 				if err := ctx.Err(); err != nil {
-					yield("", err)
+					yield(s3ListedKey{}, err)
 					return
 				}
 			}
@@ -757,7 +756,7 @@ func (s *S3Stores) listRefs(ctx context.Context, prefix, delimiter string) iter.
 			}
 			token = page.NextContinuationToken
 			if token == "" || seen[token] {
-				yield("", errors.New("invalid list continuation token"))
+				yield(s3ListedKey{}, errors.New("invalid list continuation token"))
 				return
 			}
 			seen[token] = true
@@ -793,28 +792,30 @@ func refNamespace(segment string) (string, bool) {
 }
 
 // Walk lists only this namespace's reference prefix and issues no per-reference
-// request. Each Info issues one reference HEAD on its first Size or Labels call.
+// request. Each Info takes Added from the listing and issues one reference HEAD on
+// its first Size or Labels call.
 func (s *S3Store) Walk(ctx context.Context) iter.Seq2[Info, error] {
 	return func(yield func(Info, error) bool) {
-		for key, err := range s.stores.listRefs(ctx, s.stores.refPrefix(s.id), "") {
+		for entry, err := range s.stores.listRefs(ctx, s.stores.refPrefix(s.id), "") {
 			if err != nil {
 				yield(nil, err)
 				return
 			}
-			d, _, ok := s.stores.parseRefKey(key)
+			d, _, ok := s.stores.parseRefKey(entry.Key)
 			if !ok {
 				continue
 			}
-			if !yield(s.lazyInfo(d), nil) {
+			if !yield(s.lazyInfo(d, entry.LastModified), nil) {
 				return
 			}
 		}
 	}
 }
 
-// lazyInfo shares one successful Stat between size and labels. NewLazyInfo
-// serializes both loads, so stat needs no lock of its own.
-func (s *S3Store) lazyInfo(d Digest) Info {
+// lazyInfo shares one successful Stat among size, labels, and an addition time the
+// listing did not report. NewLazyInfo serializes the loads, so stat needs no lock
+// of its own.
+func (s *S3Store) lazyInfo(d Digest, listed time.Time) Info {
 	var stat Info
 	load := func(ctx context.Context) (Info, error) {
 		if stat == nil {
@@ -832,6 +833,15 @@ func (s *S3Store) lazyInfo(d Digest) Info {
 			return 0, err
 		}
 		return info.Size(ctx)
+	}, func(ctx context.Context) (time.Time, error) {
+		if !listed.IsZero() {
+			return listed, nil
+		}
+		info, err := load(ctx)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return info.Added(ctx)
 	}, func(ctx context.Context) (Labels, error) {
 		info, err := load(ctx)
 		if err != nil {
@@ -845,12 +855,12 @@ func (s *S3Store) lazyInfo(d Digest) Info {
 // than one per reference.
 func (s *S3Stores) Namespaces(ctx context.Context) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
-		for prefix, err := range s.listRefs(ctx, s.prefix+"refs/", "/") {
+		for entry, err := range s.listRefs(ctx, s.prefix+"refs/", "/") {
 			if err != nil {
 				yield("", err)
 				return
 			}
-			segment, ok := strings.CutPrefix(prefix, s.prefix+"refs/")
+			segment, ok := strings.CutPrefix(entry.Key, s.prefix+"refs/")
 			if !ok {
 				continue
 			}
@@ -1403,17 +1413,17 @@ func (s *s3Stage) Abort(ctx context.Context) error {
 	return s.release(ctx, m, etag)
 }
 
-type s3StageListedKey struct {
+type s3ListedKey struct {
 	Key          string
 	LastModified time.Time
 }
 
-func (g *S3Stores) stageKeys(ctx context.Context, only ...string) ([]s3StageListedKey, error) {
+func (g *S3Stores) stageKeys(ctx context.Context, only ...string) ([]s3ListedKey, error) {
 	prefix := g.prefix + "stages/"
 	if len(only) > 0 {
 		prefix = only[0]
 	}
-	var keys []s3StageListedKey
+	var keys []s3ListedKey
 	token := ""
 	seen := map[string]bool{}
 	for {
@@ -1431,7 +1441,7 @@ func (g *S3Stores) stageKeys(ctx context.Context, only ...string) ([]s3StageList
 		}
 		var page struct {
 			XMLName                             xml.Name `xml:"ListBucketResult"`
-			Contents                            []s3StageListedKey
+			Contents                            []s3ListedKey
 			IsTruncated                         bool
 			NextContinuationToken, EncodingType string
 		}
@@ -1468,7 +1478,7 @@ func (g *S3Stores) PruneStages(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	groups := map[string][]s3StageListedKey{}
+	groups := map[string][]s3ListedKey{}
 	stages := map[string]*s3Stage{}
 	records := map[string]*s3StageManifest{}
 	protected := map[string]bool{}
@@ -1701,7 +1711,7 @@ func (r *s3StageInput) Read(p []byte) (int, error) {
 
 // cleanChunks runs under a manifest lease. Active stages retain all currently
 // referenced chunks and any recent attempt data that could still be in flight.
-func (s *s3Stage) cleanChunks(ctx context.Context, m *s3StageManifest, objects []s3StageListedKey, expired bool) error {
+func (s *s3Stage) cleanChunks(ctx context.Context, m *s3StageManifest, objects []s3ListedKey, expired bool) error {
 	keep := map[string]bool{}
 	for _, chunk := range m.Chunks {
 		keep[chunk.Key] = true

@@ -667,7 +667,7 @@ func TestCacheFlightWriteFailure(t *testing.T) {
 					opens.Add(1)
 					r, info, err := source.Open(ctx, d)
 					if stage == "labels" {
-						info = NewInfo(d, int64(len(content)), func(context.Context) (Labels, error) { <-gate; return nil, errors.New("label failure") })
+						info = NewInfo(d, int64(len(content)), time.Time{}, func(context.Context) (Labels, error) { <-gate; return nil, errors.New("label failure") })
 					}
 					return r, info, err
 				}}
@@ -724,7 +724,7 @@ func TestCacheFlightCancellationDuringWriter(t *testing.T) {
 					first := opens.Add(1) == 1
 					r, info, err := source.Open(ctx, d)
 					if stage == "labels" && first {
-						info = NewInfo(d, int64(len(content)), func(ctx context.Context) (Labels, error) { <-stalled; return nil, ctx.Err() })
+						info = NewInfo(d, int64(len(content)), time.Time{}, func(ctx context.Context) (Labels, error) { <-stalled; return nil, ctx.Err() })
 					}
 					return r, info, err
 				}}
@@ -784,7 +784,7 @@ func TestCacheFlightLeaderCancellationClosesSource(t *testing.T) {
 		var calls atomic.Int32
 		origin := flightTestStore{Store: source, open: func(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, error) {
 			if calls.Add(1) == 1 {
-				return blocked, NewInfo(d, int64(len(content)), nil), nil
+				return blocked, NewInfo(d, int64(len(content)), time.Time{}, nil), nil
 			}
 			return source.Open(ctx, d)
 		}}

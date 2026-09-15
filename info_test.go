@@ -5,13 +5,14 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestInfoLazyLabels(t *testing.T) {
 	calls := 0
 	source := Labels{"Test": {"original"}}
 	d := DigestFromBytes([]byte("hello"))
-	info := NewInfo(d, 5, func(context.Context) (Labels, error) {
+	info := NewInfo(d, 5, time.Time{}, func(context.Context) (Labels, error) {
 		calls++
 		return source, nil
 	})
@@ -37,7 +38,7 @@ func TestInfoLazyLabels(t *testing.T) {
 func TestInfoRetriesFailedLoadWithCallerContext(t *testing.T) {
 	type key struct{}
 	calls := 0
-	info := NewInfo("", 0, func(ctx context.Context) (Labels, error) {
+	info := NewInfo("", 0, time.Time{}, func(ctx context.Context) (Labels, error) {
 		calls++
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -61,7 +62,7 @@ func TestInfoRetriesFailedLoadWithCallerContext(t *testing.T) {
 func TestInfoMemoizesNilLabels(t *testing.T) {
 	calls := 0
 	for _, loader := range []func(context.Context) (Labels, error){nil, func(context.Context) (Labels, error) { calls++; return nil, nil }} {
-		info := NewInfo("", 0, loader)
+		info := NewInfo("", 0, time.Time{}, loader)
 		for range 2 {
 			labels, err := info.Labels(t.Context())
 			if err != nil || labels != nil {
@@ -76,7 +77,7 @@ func TestInfoMemoizesNilLabels(t *testing.T) {
 
 func TestInfoConcurrentLabels(t *testing.T) {
 	calls := 0 // A race is a test failure if the loader is not serialized.
-	info := NewInfo("", 0, func(context.Context) (Labels, error) {
+	info := NewInfo("", 0, time.Time{}, func(context.Context) (Labels, error) {
 		calls++
 		return Labels{"Test": {"original"}}, nil
 	})
@@ -118,7 +119,7 @@ func TestLazyInfoLoadsSizeOnDemand(t *testing.T) {
 			return 0, errors.New("unavailable")
 		}
 		return 5, nil
-	}, func(context.Context) (Labels, error) {
+	}, nil, func(context.Context) (Labels, error) {
 		labels++
 		return nil, nil
 	})
@@ -138,11 +139,14 @@ func TestLazyInfoLoadsSizeOnDemand(t *testing.T) {
 	}
 }
 
-func TestLazyInfoSerializesSizeAndLabels(t *testing.T) {
-	shared := 0 // A race is a test failure if the two loaders run concurrently.
+func TestLazyInfoSerializesLoads(t *testing.T) {
+	shared := 0 // A race is a test failure if the loaders run concurrently.
 	info := NewLazyInfo("", func(context.Context) (int64, error) {
 		shared++
 		return int64(shared), nil
+	}, func(context.Context) (time.Time, error) {
+		shared++
+		return time.Unix(int64(shared), 0), nil
 	}, func(context.Context) (Labels, error) {
 		shared++
 		return nil, nil
@@ -150,10 +154,49 @@ func TestLazyInfoSerializesSizeAndLabels(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 32 {
 		wg.Go(func() { info.Size(t.Context()) })
+		wg.Go(func() { info.Added(t.Context()) })
 		wg.Go(func() { info.Labels(t.Context()) })
 	}
 	wg.Wait()
-	if shared != 2 {
+	if shared != 3 {
 		t.Fatalf("loaded %d times", shared)
+	}
+}
+
+func TestInfoAdded(t *testing.T) {
+	at := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	if added, err := NewInfo("", 0, at, nil).Added(t.Context()); err != nil || !added.Equal(at) {
+		t.Fatalf("known Added = %v, %v", added, err)
+	}
+	for _, info := range []Info{
+		NewInfo("", 0, time.Time{}, nil),
+		NewLazyInfo("", nil, nil, nil),
+		NewLazyInfo("", nil, func(context.Context) (time.Time, error) { return time.Time{}, nil }, nil),
+	} {
+		if _, err := info.Added(t.Context()); !errors.Is(err, errors.ErrUnsupported) {
+			t.Fatalf("unknown Added = %v", err)
+		}
+	}
+	calls := 0
+	lazy := NewLazyInfo("", nil, func(context.Context) (time.Time, error) {
+		calls++
+		if calls == 1 {
+			return time.Time{}, errors.New("unavailable")
+		}
+		return at, nil
+	}, nil)
+	if calls != 0 {
+		t.Fatal("construction loaded the time")
+	}
+	if _, err := lazy.Added(t.Context()); err == nil || errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("failed Added = %v", err)
+	}
+	for range 2 {
+		if added, err := lazy.Added(t.Context()); err != nil || !added.Equal(at) {
+			t.Fatalf("retried Added = %v, %v", added, err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("loaded %d times", calls)
 	}
 }

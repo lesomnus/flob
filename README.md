@@ -179,8 +179,9 @@ not a union with the origin or secondary. HTTP does not expose enumeration.
 
 A walk reads only the inventory itself: S3 lists the namespace's references and
 the OS backend reads directory entries. Their `Info` values load size and labels
-on first use, with one reference `HEAD` on S3 or one `stat` on the filesystem. An
-entry removed after it was listed can report `ErrNotExist` from `Size` or `Labels`.
+on first use, with one reference `HEAD` on S3 or one `stat` on the filesystem; S3
+takes `Added` from the listing itself. An entry removed after it was listed can
+report `ErrNotExist` from `Size`, `Added`, or `Labels`.
 
 ## Blob information and lazy labels
 
@@ -207,8 +208,17 @@ receive labels with their metadata response, so accessing them needs no extra
 request. Missing blobs return `ErrNotExist` from `Stat` or `Open` immediately;
 label-loading errors are reported by `Labels`.
 
-Each `Info` caches its first successful size and labels loads and returns
-independent copies of labels. Failed loads can be retried, and each attempt uses the context supplied
+`info.Added(ctx)` reports when the store last created or changed its entry for
+the digest: `Add`, `Link`, a staged commit, or `Label`. Adding a digest the store
+already holds does not change it, so a collector can leave recently added blobs
+alone. Memory records the time; the filesystem uses the digest directory's
+modification time, stamped just before the entry is published; S3 uses the
+reference marker's `Last-Modified` (whole seconds from `HEAD`, milliseconds from a
+walk's listing); HTTP carries it as `Last-Modified`. When a store cannot tell,
+`Added` returns `errors.ErrUnsupported`.
+
+Each `Info` caches its first successful size, addition time, and labels loads and
+returns independent copies of labels. Failed loads can be retried, and each attempt uses the context supplied
 to `Labels`. Digest, size, and labels are not guaranteed to describe one atomic
 snapshot: the blob or labels may change between the initial lookup and the
 first labels access. Obtain a new `Info` to refresh a successful labels result.
@@ -217,8 +227,9 @@ Cache and fallback stores keep labels bound to the store that supplied the info.
 This is a breaking API change: `Get`, the optional `Stater`, and `AsStater` have
 been removed. Replace `Get` with `Stat`, use `Digest()` and `Size(ctx)`, and call
 `Labels(ctx)` when needed. Store implementations must implement `Stat` and
-return `Info` from `Open`; `NewInfo` provides a labels loader with the caching
-behavior above, and `NewLazyInfo` also defers the size. `Meta` remains the data type used by `Add` and `PresignOpen`.
+return `Info` from `Open`; `NewInfo` takes a known size and addition time with a
+labels loader that has the caching behavior above, and `NewLazyInfo` also defers
+the size and addition time. `Meta` remains the data type used by `Add` and `PresignOpen`.
 
 ## Design & Consistency
 
