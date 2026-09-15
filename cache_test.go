@@ -761,6 +761,135 @@ func TestCacheFlightCancellationDuringWriter(t *testing.T) {
 	}
 }
 
+// slowCommitStore reads the whole blob, then keeps working under ctx before it
+// commits, as a bucket PUT does after its last byte.
+func slowCommitStore(primary Store, delay time.Duration, committed chan<- error) Store {
+	return flightTestStore{Store: primary, add: func(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
+		data, err := io.ReadAll(r)
+		if err == nil {
+			select {
+			case <-time.After(delay):
+				m, err = primary.Add(ctx, m, bytes.NewReader(data))
+			case <-ctx.Done():
+				err = ctx.Err()
+			}
+		}
+		if committed != nil {
+			committed <- err
+		}
+		return m, err
+	}}
+}
+
+func TestCacheFillOutlivesOpenContext(t *testing.T) {
+	for _, order := range []string{"close then cancel", "cancel then close"} {
+		t.Run(order, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const content = "content"
+				source, primary := NewMemStores().Use("t"), NewMemStores().Use("t")
+				d := flightAdd(t, source, content)
+				cache := NewCacheStore(slowCommitStore(primary, 50*time.Millisecond, nil), source)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				leader, _, err := cache.Open(ctx, d)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err := io.ReadAll(leader); err != nil || string(got) != content {
+					t.Fatalf("read = %q, %v", got, err)
+				}
+				follower := flightOpen(t.Context(), cache, d)
+				synctest.Wait()
+				if order == "close then cancel" {
+					leader.Close()
+					cancel()
+				} else {
+					cancel()
+					leader.Close()
+				}
+				synctest.Wait()
+				// The detached write still holds the flight.
+				flightPending(t, follower)
+				time.Sleep(time.Second)
+				synctest.Wait()
+				if _, err := primary.Stat(t.Context(), d); err != nil {
+					t.Fatalf("blob was not cached: %v", err)
+				}
+				flightReadResult(t, follower, content)
+				flightActive(t, &cache.local, 0)
+			})
+		})
+	}
+}
+
+func TestCacheFillTimeoutStartsAfterLastByte(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const content = "0123456789"
+		source, primary := NewMemStores().Use("t"), NewMemStores().Use("t")
+		d := flightAdd(t, source, content)
+		committed := make(chan error, 1)
+		cache := NewCacheStore(slowCommitStore(primary, time.Hour, committed), source)
+		cache.FillTimeout = time.Minute
+		leader, _, err := cache.Open(t.Context(), d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Streaming slower than the timeout does not count against it.
+		head := make([]byte, 5)
+		if _, err := io.ReadFull(leader, head); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Minute)
+		flightRead(t, leader, content[5:])
+		time.Sleep(30 * time.Second)
+		synctest.Wait()
+		flightActive(t, &cache.local, 1)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if err := <-committed; !errors.Is(err, context.Canceled) {
+			t.Fatalf("timed-out write = %v", err)
+		}
+		flightActive(t, &cache.local, 0)
+		if _, err := primary.Stat(t.Context(), d); !errors.Is(err, ErrNotExist) {
+			t.Fatalf("timed-out write committed: %v", err)
+		}
+	})
+}
+
+func TestCacheFillOutlivesHttpRequest(t *testing.T) {
+	const content = "content"
+	origin, primary := NewMemStores(), NewMemStores()
+	d := flightAdd(t, origin.Use("t"), content)
+	committed := make(chan error, 1)
+	stores := NewCacheStores(wrapStores{inner: primary, wrap: func(s Store) Store {
+		return slowCommitStore(s, 50*time.Millisecond, committed)
+	}}, origin)
+	server := httptest.NewServer(HttpHandler{Stores: stores})
+	defer server.Close()
+	response, err := server.Client().Get(server.URL + "/t/" + string(d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil || string(got) != content {
+		t.Fatalf("GET = %q, %v", got, err)
+	}
+	// net/http cancels the request context once the handler returns, before the
+	// primary finishes committing.
+	select {
+	case err := <-committed:
+		if err != nil {
+			t.Fatalf("cache write = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cache write did not finish")
+	}
+	if _, err := primary.Use("t").Stat(t.Context(), d); err != nil {
+		t.Fatalf("blob was not cached: %v", err)
+	}
+}
+
 type flightBlockingReader struct {
 	closed       chan struct{}
 	closeEntered chan struct{}
