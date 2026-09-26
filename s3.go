@@ -85,6 +85,16 @@ type S3Config struct {
 	// Client is the HTTP client used for all requests. Defaults to
 	// [http.DefaultClient].
 	Client *http.Client
+	// SpoolDir is where Add writes a blob before uploading it, which it must:
+	// the request is signed with the payload's hash, known only once the
+	// whole blob has been read. Empty is [os.TempDir].
+	//
+	// Every blob being added is a whole file here at once, so this directory
+	// has to hold the largest of them times however many are added
+	// concurrently. On a memory-backed filesystem -- a tmpfs /tmp, a
+	// Kubernetes emptyDir with medium Memory -- that is memory, charged to
+	// the process: point it at a disk.
+	SpoolDir string
 
 	// now is injectable for deterministic tests; defaults to time.Now.
 	now func() time.Time
@@ -94,6 +104,7 @@ type S3Config struct {
 type S3Stores struct {
 	stage         StageConfig
 	stagePartSize int64
+	spoolDir      string
 	cl            *http.Client
 	signer        signer
 	scheme        string
@@ -155,6 +166,7 @@ func NewS3Stores(cfg S3Config) (*S3Stores, error) {
 	return &S3Stores{
 		stage:         cfg.Stage.normalized(),
 		stagePartSize: cfg.StagePartSize,
+		spoolDir:      cfg.SpoolDir,
 		cl:            cl,
 		signer:        signer{creds: cfg.Credentials, region: cfg.Region, service: "s3", now: now},
 		scheme:        scheme,
@@ -363,10 +375,14 @@ func (s *S3Store) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	}
 
 	// Buffer to a temp file while computing the blob digest and the SHA-256
-	// payload hash required for signing.
-	tf, err := os.CreateTemp("", "flob-s3-*")
+	// payload hash required for signing; see [S3Config.SpoolDir] for where.
+	dir := g.spoolDir
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	tf, err := os.CreateTemp(dir, "flob-s3-*")
 	if err != nil {
-		return m, fmt.Errorf("create temp: %w", err)
+		return m, fmt.Errorf("create temp in %s: %w", dir, err)
 	}
 	tp := tf.Name()
 	defer os.Remove(tp)
