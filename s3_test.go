@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1489,4 +1491,67 @@ func TestS3StageReadAndBeginOperationTimeout(t *testing.T) {
 	if _, err := st.Stat(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Stat timeout = %v", err)
 	}
+}
+
+// spoolWatch reads r, and on its first read records what is in dir: the
+// file Add is writing the blob to, if it is writing it there.
+type spoolWatch struct {
+	r    io.Reader
+	dir  string
+	seen []string
+}
+
+func (w *spoolWatch) Read(b []byte) (int, error) {
+	if w.seen == nil {
+		es, _ := os.ReadDir(w.dir)
+		w.seen = []string{}
+		for _, e := range es {
+			w.seen = append(w.seen, e.Name())
+		}
+	}
+	return w.r.Read(b)
+}
+
+func TestS3SpoolDir(t *testing.T) {
+	ctx := context.Background()
+	mock := newMockS3("flob-test")
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	open := func(dir string) Store {
+		stores, err := NewS3Stores(S3Config{
+			Endpoint:     srv.URL,
+			Region:       "us-east-1",
+			Bucket:       "flob-test",
+			Credentials:  Credentials{AccessKeyID: "AKIAEXAMPLE", SecretAccessKey: "secretexample"},
+			UsePathStyle: true,
+			Client:       srv.Client(),
+			SpoolDir:     dir,
+		})
+		if err != nil {
+			t.Fatalf("new s3 stores: %v", err)
+		}
+		return stores.Use("ns")
+	}
+
+	t.Run("the blob is spooled where it is told", func(t *testing.T) {
+		dir := t.TempDir()
+		w := &spoolWatch{r: strings.NewReader("spooled"), dir: dir}
+		if _, err := open(dir).Add(ctx, Meta{}, w); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		if len(w.seen) != 1 || !strings.HasPrefix(w.seen[0], "flob-s3-") {
+			t.Fatalf("while reading, %s held %v; want the one spool file", dir, w.seen)
+		}
+		if es, _ := os.ReadDir(dir); len(es) != 0 {
+			t.Fatalf("after Add, %s still holds %d entries", dir, len(es))
+		}
+	})
+
+	t.Run("a directory that is not there is named", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "missing")
+		_, err := open(dir).Add(ctx, Meta{}, strings.NewReader("x"))
+		if err == nil || !strings.Contains(err.Error(), dir) {
+			t.Fatalf("add: %v; want an error naming %s", err, dir)
+		}
+	})
 }
