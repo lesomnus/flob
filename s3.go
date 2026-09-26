@@ -8,6 +8,8 @@ package flob
 //	<prefix>blob/<algo>/<hex>            the one shared copy of each blob (dedup)
 //	<prefix>refs/<store>/<algo>/<hex>   per-store reference marker; labels + size
 //	                                    are kept in the marker's x-amz-meta-* headers
+//	<prefix>probe/checksum              written by the checksum probe (see
+//	                                    [S3DirectAdd]), then removed if allowed
 //
 // A blob is content-addressed, so identical content from any store resolves to
 // the same blob/ key and is uploaded once. Visibility is per store: a blob is
@@ -23,11 +25,14 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"github.com/opencontainers/go-digest"
+	"hash"
 	"io"
 	"iter"
 	"net/http"
@@ -36,6 +41,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -85,9 +91,10 @@ type S3Config struct {
 	// Client is the HTTP client used for all requests. Defaults to
 	// [http.DefaultClient].
 	Client *http.Client
-	// SpoolDir is where Add writes a blob before uploading it, which it must:
-	// the request is signed with the payload's hash, known only once the
-	// whole blob has been read. Empty is [os.TempDir].
+	// SpoolDir is where Add writes a blob before uploading it, which it must
+	// unless it can stream the blob (see [S3DirectAdd]): the request is signed
+	// with the payload's hash, known only once the whole blob has been read.
+	// Empty is [os.TempDir].
 	//
 	// Every blob being added is a whole file here at once, so this directory
 	// has to hold the largest of them times however many are added
@@ -95,16 +102,41 @@ type S3Config struct {
 	// Kubernetes emptyDir with medium Memory -- that is memory, charged to
 	// the process: point it at a disk.
 	SpoolDir string
+	// DirectAdd decides whether Add may skip the spool; see [S3DirectAdd].
+	// The zero value probes the service.
+	DirectAdd S3DirectAdd
 
 	// now is injectable for deterministic tests; defaults to time.Now.
 	now func() time.Time
 }
+
+// S3DirectAdd selects whether [S3Store.Add] streams a blob straight to the
+// bucket instead of spooling it first. Only an Add whose m.Digest is sha256 and
+// whose m.Size is positive can: the body is sent as UNSIGNED-PAYLOAD with the
+// digest in x-amz-checksum-sha256, so the service, not the spool, rejects bytes
+// that do not match. A service that ignores that header would store them, which
+// is why the default asks the service first.
+type S3DirectAdd int
+
+const (
+	// S3DirectAddProbe checks once, on the first Add that could stream, that
+	// the service rejects a PUT whose x-amz-checksum-sha256 is wrong and
+	// accepts one whose checksum is right. Adds spool until the check has an
+	// answer; a check that fails for any other reason is tried again later.
+	S3DirectAddProbe S3DirectAdd = iota
+	// S3DirectAddAlways streams without checking the service.
+	S3DirectAddAlways
+	// S3DirectAddNever always spools.
+	S3DirectAddNever
+)
 
 // S3Stores is a content-addressable [Stores] backed by a single S3 bucket.
 type S3Stores struct {
 	stage         StageConfig
 	stagePartSize int64
 	spoolDir      string
+	directAdd     S3DirectAdd
+	checksums     *checksumProbe
 	cl            *http.Client
 	signer        signer
 	scheme        string
@@ -126,6 +158,9 @@ func NewS3Stores(cfg S3Config) (*S3Stores, error) {
 	}
 	if cfg.Bucket == "" {
 		return nil, errors.New("s3: bucket is required")
+	}
+	if cfg.DirectAdd < S3DirectAddProbe || cfg.DirectAdd > S3DirectAddNever {
+		return nil, fmt.Errorf("s3: invalid direct add mode %d", cfg.DirectAdd)
 	}
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"
@@ -167,6 +202,8 @@ func NewS3Stores(cfg S3Config) (*S3Stores, error) {
 		stage:         cfg.Stage.normalized(),
 		stagePartSize: cfg.StagePartSize,
 		spoolDir:      cfg.SpoolDir,
+		directAdd:     cfg.DirectAdd,
+		checksums:     &checksumProbe{},
 		cl:            cl,
 		signer:        signer{creds: cfg.Credentials, region: cfg.Region, service: "s3", now: now},
 		scheme:        scheme,
@@ -288,22 +325,37 @@ func (s *S3Stores) exists(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
-// putBlob uploads the shared blob using its SHA-256 payload hash for signing.
-func (s *S3Stores) putBlob(ctx context.Context, d Digest, body io.Reader, size int64, payloadHash string) error {
-	req, err := s.newRequest(ctx, http.MethodPut, s.blobKey(d), nil, body)
+// putObject uploads size bytes of body to key, signed with payloadHash (see
+// [signer.sign]). A non-nil checksum is sent as x-amz-checksum-sha256, for the
+// service to check the body against. The caller closes the response body.
+func (s *S3Stores) putObject(ctx context.Context, key string, body io.Reader, size int64, payloadHash string, checksum []byte) (*http.Response, error) {
+	req, err := s.newRequest(ctx, http.MethodPut, key, nil, body)
 	if err != nil {
-		return err
+		// Close it as the transport would have.
+		if c, ok := body.(io.Closer); ok {
+			c.Close()
+		}
+		return nil, err
 	}
 	req.ContentLength = size
-	res, err := s.send(req, payloadHash)
+	if checksum != nil {
+		req.Header.Set("X-Amz-Checksum-Sha256", base64.StdEncoding.EncodeToString(checksum))
+	}
+	return s.send(req, payloadHash)
+}
+
+// putBlob uploads the shared blob and returns its strong ETag, if the service
+// gave one. See [S3Stores.putObject] for payloadHash and checksum.
+func (s *S3Stores) putBlob(ctx context.Context, d Digest, body io.Reader, size int64, payloadHash string, checksum []byte) (string, error) {
+	res, err := s.putObject(ctx, s.blobKey(d), body, size, payloadHash, checksum)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer res.Body.Close()
 	if res.StatusCode/100 != 2 {
-		return statusError("put blob", res)
+		return "", statusError("put blob", res)
 	}
-	return nil
+	return strongETag(res.Header.Get("ETag")), nil
 }
 
 // putRef writes the per-store reference marker with labels and size in its
@@ -331,9 +383,18 @@ func (s *S3Stores) putRef(ctx context.Context, d Digest, id string, labels Label
 
 // deleteKey removes key. A missing key is not an error.
 func (s *S3Stores) deleteKey(ctx context.Context, key string) error {
+	return s.deleteKeyIf(ctx, key, "")
+}
+
+// deleteKeyIf removes key if its ETag is etag; an empty etag removes it
+// regardless. A missing key is not an error.
+func (s *S3Stores) deleteKeyIf(ctx context.Context, key, etag string) error {
 	req, err := s.newRequest(ctx, http.MethodDelete, key, nil, nil)
 	if err != nil {
 		return err
+	}
+	if etag != "" {
+		req.Header.Set("If-Match", etag)
 	}
 	res, err := s.send(req, emptyPayloadHash)
 	if err != nil {
@@ -354,28 +415,107 @@ type S3Store struct {
 	id     string
 }
 
+// Add stores r under m.Digest, or under the digest it computes when that is
+// empty. With a digest given, content the bucket already holds is read only to
+// verify it, and a sha256 blob with a positive m.Size may be streamed straight
+// to the bucket (see [S3DirectAdd]), where an m.Size that is not r's length
+// fails as [ErrDigestMismatch]. Anything else is spooled first; see
+// [S3Config.SpoolDir].
 func (s *S3Store) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	g := s.stores
-
-	algo := Canonical
-	if m.Digest != "" {
-		d, err := m.Digest.Sanitize()
-		if err != nil {
-			return m, err
-		}
-		m.Digest = d
-		algo = d.Algorithm()
-
-		// Duplicate check is scoped to this store: only its reference counts.
-		if ok, err := g.exists(ctx, g.refKey(d, s.id)); err != nil {
-			return m, err
-		} else if ok {
-			return m, ErrAlreadyExists
-		}
+	if m.Digest == "" {
+		return s.spool(ctx, m, Canonical, r)
 	}
 
-	// Buffer to a temp file while computing the blob digest and the SHA-256
-	// payload hash required for signing; see [S3Config.SpoolDir] for where.
+	d, err := m.Digest.Sanitize()
+	if err != nil {
+		return m, err
+	}
+	m.Digest = d
+
+	// Duplicate check is scoped to this store: only its reference counts.
+	if ok, err := g.exists(ctx, g.refKey(d, s.id)); err != nil {
+		return m, err
+	} else if ok {
+		return m, ErrAlreadyExists
+	}
+
+	// Content already present from another store is not uploaded again, so it
+	// is not spooled either: r is read only to verify it.
+	if ok, err := g.exists(ctx, g.blobKey(d)); err != nil {
+		return m, err
+	} else if ok {
+		v := newVerifyReader(r, d.Algorithm())
+		if _, err := io.Copy(io.Discard, v); err != nil {
+			return m, fmt.Errorf("read blob: %w", err)
+		}
+		if v.sum() != d {
+			return m, ErrDigestMismatch
+		}
+		return s.addRef(ctx, m, v.n)
+	}
+
+	if d.Algorithm() == digest.SHA256 && m.Size > 0 && g.streams(ctx) {
+		return s.stream(ctx, m, r)
+	}
+	return s.spool(ctx, m, d.Algorithm(), r)
+}
+
+// stream uploads r straight to the blob key as UNSIGNED-PAYLOAD, leaving it to
+// the service to refuse a body whose SHA-256 is not m.Digest's.
+func (s *S3Store) stream(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
+	g := s.stores
+	d := m.Digest
+	sum, err := hex.DecodeString(d.Encoded())
+	if err != nil {
+		return m, err
+	}
+
+	v := newVerifyReader(r, digest.SHA256)
+	body := &notifyCloser{Reader: io.LimitReader(v, m.Size), done: make(chan struct{})}
+	etag, err := g.putBlob(ctx, d, body, m.Size, unsignedPayload, sum)
+	// The transport may still be reading the body when it returns; it stops
+	// once it closes it.
+	<-body.done
+	if v.err != nil && v.err != io.EOF {
+		return m, fmt.Errorf("read blob: %w", v.err)
+	}
+	if v.n < m.Size && v.err == io.EOF {
+		return m, ErrDigestMismatch
+	}
+	if err != nil {
+		if v.n == m.Size && v.sum() != d {
+			// Refused for its checksum.
+			return m, ErrDigestMismatch
+		}
+		return m, err
+	}
+	if v.sum() != d {
+		// Stored even though it does not match: the service ignores the
+		// checksum. Take the object back, and spool from now on.
+		g.checksums.ignored()
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.stage.OperationTimeout)
+		defer cancel()
+		g.deleteKeyIf(cleanup, g.blobKey(d), etag)
+		return m, ErrDigestMismatch
+	}
+
+	// The service took m.Size bytes, so r must end there.
+	var b [1]byte
+	if n, err := io.ReadFull(r, b[:]); n > 0 {
+		return m, ErrDigestMismatch
+	} else if err != io.EOF {
+		return m, fmt.Errorf("read blob: %w", err)
+	}
+	return s.addRef(ctx, m, m.Size)
+}
+
+// spool buffers r to a temp file while computing the blob digest with algo and
+// the SHA-256 payload hash required for signing, then uploads it.
+func (s *S3Store) spool(ctx context.Context, m Meta, algo digest.Algorithm, r io.Reader) (Meta, error) {
+	g := s.stores
+
+	// See [S3Config.SpoolDir] for where.
 	dir := g.spoolDir
 	if dir == "" {
 		dir = os.TempDir()
@@ -421,16 +561,160 @@ func (s *S3Store) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 		if _, err := tf.Seek(0, io.SeekStart); err != nil {
 			return m, fmt.Errorf("seek temp: %w", err)
 		}
-		if err := g.putBlob(ctx, d, tf, n, fmt.Sprintf("%x", payloadHash.Sum(nil))); err != nil {
+		if _, err := g.putBlob(ctx, d, tf, n, fmt.Sprintf("%x", payloadHash.Sum(nil)), nil); err != nil {
 			return m, err
 		}
 	}
+	return s.addRef(ctx, m, n)
+}
 
-	if err := g.putRef(ctx, d, s.id, m.Labels, n); err != nil {
+// addRef writes this store's reference to the blob m.Digest, size bytes long.
+func (s *S3Store) addRef(ctx context.Context, m Meta, size int64) (Meta, error) {
+	m.Size = size
+	if err := s.stores.putRef(ctx, m.Digest, s.id, m.Labels, size); err != nil {
 		return m, err
 	}
-
 	return m.Clone(), nil
+}
+
+// verifyReader hashes and counts what is read through it, and keeps the first
+// error its source returned.
+type verifyReader struct {
+	r    io.Reader
+	algo digest.Algorithm
+	h    hash.Hash
+	n    int64
+	err  error
+}
+
+func newVerifyReader(r io.Reader, algo digest.Algorithm) *verifyReader {
+	return &verifyReader{r: r, algo: algo, h: algo.Hash()}
+}
+
+func (v *verifyReader) Read(b []byte) (int, error) {
+	n, err := v.r.Read(b)
+	v.h.Write(b[:n])
+	v.n += int64(n)
+	if err != nil && v.err == nil {
+		v.err = err
+	}
+	return n, err
+}
+
+// sum is the digest of what has been read.
+func (v *verifyReader) sum() Digest {
+	return Digest(fmt.Sprintf("%s:%x", v.algo, v.h.Sum(nil)))
+}
+
+// notifyCloser closes done when it is closed.
+type notifyCloser struct {
+	io.Reader
+	once sync.Once
+	done chan struct{}
+}
+
+func (c *notifyCloser) Close() error {
+	c.once.Do(func() { close(c.done) })
+	return nil
+}
+
+// checksumProbe remembers whether the service checks x-amz-checksum-sha256.
+type checksumProbe struct {
+	mu      sync.Mutex
+	running bool
+	known   bool
+	checks  bool
+}
+
+// ignored records that the service stored a body its checksum did not match.
+func (p *checksumProbe) ignored() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.known, p.checks = true, false
+}
+
+// streams reports whether Add may stream a blob instead of spooling it; see
+// [S3DirectAdd]. While the first probe runs, other Adds spool rather than wait.
+func (s *S3Stores) streams(ctx context.Context) bool {
+	switch s.directAdd {
+	case S3DirectAddAlways:
+		return true
+	case S3DirectAddNever:
+		return false
+	}
+
+	p := s.checksums
+	p.mu.Lock()
+	if p.known || p.running {
+		defer p.mu.Unlock()
+		return p.known && p.checks
+	}
+	p.running = true
+	p.mu.Unlock()
+
+	checks, err := s.probeChecksums(ctx)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.running = false
+	if err != nil {
+		return false
+	}
+	if !p.known {
+		p.known, p.checks = true, checks
+	}
+	return p.known && p.checks
+}
+
+// probeKey is where [S3Stores.probeChecksums] writes; it holds nothing between
+// probes.
+func (s *S3Stores) probeKey() string {
+	return s.prefix + "probe/checksum"
+}
+
+// probeChecksums asks the service whether it checks x-amz-checksum-sha256 on an
+// UNSIGNED-PAYLOAD PUT: it must refuse a body whose checksum is wrong with 400,
+// and store one whose checksum is right. Any other refusal is also a no. The
+// error is for an answer it could not get: a failed request or a 5xx. Deleting
+// the probe object afterwards is only tidying: without permission to delete,
+// it stays, and the answer stands.
+func (s *S3Stores) probeChecksums(ctx context.Context) (bool, error) {
+	key := s.probeKey()
+	body := []byte("flob checksum probe")
+	right := sha256.Sum256(body)
+	wrong := sha256.Sum256(nil)
+
+	res, err := s.putObject(ctx, key, bytes.NewReader(body), int64(len(body)), unsignedPayload, wrong[:])
+	if err != nil {
+		return false, err
+	}
+	defer res.Body.Close()
+	switch {
+	case res.StatusCode == http.StatusBadRequest:
+	case res.StatusCode/100 == 2:
+		// Stored regardless.
+		s.deleteKey(ctx, key)
+		return false, nil
+	case res.StatusCode/100 == 4:
+		return false, nil
+	default:
+		return false, statusError("probe checksum", res)
+	}
+
+	res, err = s.putObject(ctx, key, bytes.NewReader(body), int64(len(body)), unsignedPayload, right[:])
+	if err != nil {
+		return false, err
+	}
+	defer res.Body.Close()
+	switch {
+	case res.StatusCode/100 == 2:
+		s.deleteKey(ctx, key)
+		return true, nil
+	case res.StatusCode/100 == 4:
+		return false, nil
+	default:
+		return false, statusError("probe checksum", res)
+	}
 }
 
 func (s *S3Store) Stat(ctx context.Context, d Digest) (Info, error) {
@@ -1256,7 +1540,7 @@ func (s *s3Stage) publish(ctx context.Context, m *s3StageManifest, etag *string)
 	}
 	if !exists {
 		if m.Offset == 0 {
-			if err := g.putBlob(ctx, m.Commit.Digest, bytes.NewReader(nil), 0, emptyPayloadHash); err != nil {
+			if _, err := g.putBlob(ctx, m.Commit.Digest, bytes.NewReader(nil), 0, emptyPayloadHash, nil); err != nil {
 				return Meta{}, err
 			}
 		} else if err := s.assemble(ctx, m, etag); err != nil {

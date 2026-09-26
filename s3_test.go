@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/lesomnus/flob/internal/x"
+	"github.com/opencontainers/go-digest"
 )
 
 // mockS3 is a minimal in-memory S3-compatible server: enough of PUT/HEAD/GET/
@@ -29,9 +31,21 @@ import (
 // lowercasing of user metadata keys so the round-trip through the real HTTP client
 // is faithful. Signatures are accepted without verification (the SigV4 algorithm
 // is pinned separately by the AWS reference vectors in sigv4_test.go). PUT payload
-// hashes are verified against the bytes received, as required by S3.
+// hashes are verified against the bytes received, as required by S3, unless the
+// payload is UNSIGNED-PAYLOAD; so is x-amz-checksum-sha256, unless
+// ignoreChecksum is set to act like a service that does not know the header.
 type mockS3 struct {
 	bucket string
+
+	ignoreChecksum bool
+	// putHook, if set, may answer a PUT with the status it returns instead of
+	// storing it; 0 lets it through.
+	putHook func(r *http.Request) int
+	// deleteHook, if set, may answer a DELETE with the status it returns
+	// instead of deleting; 0 lets it through.
+	deleteHook func(r *http.Request) int
+	// unsignedPuts counts UNSIGNED-PAYLOAD PUTs of blob/ keys.
+	unsignedPuts atomic.Int32
 
 	mu         sync.Mutex
 	objects    map[string]mockObject // keyed by in-bucket key
@@ -93,6 +107,12 @@ func (m *mockS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		m.getOrHead(w, r, key, true)
 	case http.MethodDelete:
+		if m.deleteHook != nil {
+			if status := m.deleteHook(r); status != 0 {
+				http.Error(w, http.StatusText(status), status)
+				return
+			}
+		}
 		m.mu.Lock()
 		if match := r.Header.Get("If-Match"); match != "" {
 			obj, ok := m.objects[key]
@@ -116,8 +136,23 @@ func (m *mockS3) put(w http.ResponseWriter, r *http.Request, key string) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if got, want := r.Header.Get("X-Amz-Content-Sha256"), fmt.Sprintf("%x", sha256.Sum256(data)); got != want {
+	if m.putHook != nil {
+		if status := m.putHook(r); status != 0 {
+			http.Error(w, http.StatusText(status), status)
+			return
+		}
+	}
+	sum := sha256.Sum256(data)
+	if got := r.Header.Get("X-Amz-Content-Sha256"); got == unsignedPayload {
+		if strings.Contains(key, "blob/") {
+			m.unsignedPuts.Add(1)
+		}
+	} else if got != fmt.Sprintf("%x", sum) {
 		http.Error(w, "XAmzContentSHA256Mismatch", http.StatusBadRequest)
+		return
+	}
+	if got := r.Header.Get("X-Amz-Checksum-Sha256"); got != "" && !m.ignoreChecksum && got != base64.StdEncoding.EncodeToString(sum[:]) {
+		http.Error(w, "BadDigest", http.StatusBadRequest)
 		return
 	}
 	meta := map[string]string{}
@@ -1554,4 +1589,277 @@ func TestS3SpoolDir(t *testing.T) {
 			t.Fatalf("add: %v; want an error naming %s", err, dir)
 		}
 	})
+}
+
+func TestS3DirectAdd(t *testing.T) {
+	type env struct {
+		mock   *mockS3
+		stores *S3Stores
+		spool  string
+	}
+	setup := func(t *testing.T, mode S3DirectAdd, prepare func(*mockS3)) env {
+		t.Helper()
+		mock := newMockS3("flob-test")
+		if prepare != nil {
+			prepare(mock)
+		}
+		srv := httptest.NewServer(mock)
+		t.Cleanup(srv.Close)
+		spool := t.TempDir()
+		stores, err := NewS3Stores(S3Config{
+			Endpoint:     srv.URL,
+			Region:       "us-east-1",
+			Bucket:       "flob-test",
+			Credentials:  Credentials{AccessKeyID: "AKIAEXAMPLE", SecretAccessKey: "secretexample"},
+			UsePathStyle: true,
+			Client:       srv.Client(),
+			SpoolDir:     spool,
+			DirectAdd:    mode,
+		})
+		if err != nil {
+			t.Fatalf("new s3 stores: %v", err)
+		}
+		return env{mock: mock, stores: stores, spool: spool}
+	}
+	// add adds data to ns under data's digest and the given size, and reports
+	// what the spool directory held while data was read.
+	add := func(e env, ns string, data string, size int64) ([]string, Meta, error) {
+		w := &spoolWatch{r: strings.NewReader(data), dir: e.spool}
+		m, err := e.stores.Use(ns).Add(context.Background(), Meta{Digest: DigestFromBytes([]byte(data)), Size: size}, w)
+		return w.seen, m, err
+	}
+	const data = "streamed straight to the bucket"
+	size := int64(len(data))
+
+	t.Run("a known sha256 blob is not spooled", func(t *testing.T) {
+		e := setup(t, S3DirectAddProbe, nil)
+		seen, m, err := add(e, "ns", data, size)
+		if err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		if len(seen) != 0 {
+			t.Fatalf("spool held %v; want nothing", seen)
+		}
+		if got := e.mock.unsignedPuts.Load(); got != 1 {
+			t.Fatalf("unsigned blob PUTs = %d; want 1", got)
+		}
+		if m.Size != size {
+			t.Fatalf("size = %d; want %d", m.Size, size)
+		}
+		if e.mock.countPrefix("probe/") != 0 {
+			t.Fatal("the probe left its object behind")
+		}
+		r, _, err := e.stores.Use("ns").Open(context.Background(), m.Digest)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer r.Close()
+		if got, _ := io.ReadAll(r); string(got) != data {
+			t.Fatalf("read %q; want %q", got, data)
+		}
+	})
+
+	t.Run("anything else is spooled", func(t *testing.T) {
+		e := setup(t, S3DirectAddProbe, nil)
+		// Each has its own content: content already in the bucket is not spooled.
+		for name, m := range map[string]Meta{
+			"no digest": {Size: size + 1},
+			"no size":   {Digest: DigestFromBytes([]byte(data + "2"))},
+			"sha512":    {Digest: Digest(digest.SHA512.FromString(data + "3")), Size: size + 1},
+		} {
+			content := data + map[string]string{"no digest": "1", "no size": "2", "sha512": "3"}[name]
+			w := &spoolWatch{r: strings.NewReader(content), dir: e.spool}
+			if _, err := e.stores.Use(name).Add(context.Background(), m, w); err != nil {
+				t.Fatalf("%s: add: %v", name, err)
+			}
+			if len(w.seen) != 1 {
+				t.Fatalf("%s: spool held %v; want the one spool file", name, w.seen)
+			}
+		}
+		if got := e.mock.unsignedPuts.Load(); got != 0 {
+			t.Fatalf("unsigned blob PUTs = %d; want 0", got)
+		}
+	})
+
+	t.Run("wrong content is refused by the service", func(t *testing.T) {
+		e := setup(t, S3DirectAddProbe, nil)
+		w := strings.NewReader(strings.ToUpper(data))
+		_, err := e.stores.Use("ns").Add(context.Background(), Meta{Digest: DigestFromBytes([]byte(data)), Size: size}, w)
+		if !errors.Is(err, ErrDigestMismatch) {
+			t.Fatalf("add: %v; want %v", err, ErrDigestMismatch)
+		}
+		if e.mock.unsignedPuts.Load() != 1 {
+			t.Fatal("the blob was not streamed")
+		}
+		if n := e.mock.count(); n != 0 {
+			t.Fatalf("bucket holds %d objects; want none", n)
+		}
+	})
+
+	t.Run("a size that is not the content's length is a mismatch", func(t *testing.T) {
+		for name, size := range map[string]int64{"short": size + 1, "long": size - 1} {
+			e := setup(t, S3DirectAddProbe, nil)
+			if _, _, err := add(e, "ns", data, size); !errors.Is(err, ErrDigestMismatch) {
+				t.Fatalf("%s: add: %v; want %v", name, err, ErrDigestMismatch)
+			}
+			if n := e.mock.countPrefix("refs/"); n != 0 {
+				t.Fatalf("%s: bucket holds %d references; want none", name, n)
+			}
+		}
+	})
+
+	t.Run("content already in the bucket is only verified", func(t *testing.T) {
+		e := setup(t, S3DirectAddNever, nil)
+		if _, _, err := add(e, "a", data, 0); err != nil {
+			t.Fatalf("add a: %v", err)
+		}
+		seen, m, err := add(e, "b", data, 0)
+		if err != nil {
+			t.Fatalf("add b: %v", err)
+		}
+		if len(seen) != 0 {
+			t.Fatalf("spool held %v; want nothing", seen)
+		}
+		if m.Size != size {
+			t.Fatalf("size = %d; want %d", m.Size, size)
+		}
+
+		w := strings.NewReader(strings.ToUpper(data))
+		_, err = e.stores.Use("c").Add(context.Background(), Meta{Digest: m.Digest}, w)
+		if !errors.Is(err, ErrDigestMismatch) {
+			t.Fatalf("add c: %v; want %v", err, ErrDigestMismatch)
+		}
+		if w.Len() != 0 {
+			t.Fatal("add c did not read to the end")
+		}
+		if _, err := e.stores.Use("c").Stat(context.Background(), m.Digest); !errors.Is(err, ErrNotExist) {
+			t.Fatalf("stat c: %v; want %v", err, ErrNotExist)
+		}
+	})
+
+	t.Run("a service that ignores the checksum is found out by the probe", func(t *testing.T) {
+		e := setup(t, S3DirectAddProbe, func(m *mockS3) { m.ignoreChecksum = true })
+		seen, _, err := add(e, "ns", data, size)
+		if err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		if len(seen) != 1 {
+			t.Fatalf("spool held %v; want the one spool file", seen)
+		}
+		if e.mock.unsignedPuts.Load() != 0 {
+			t.Fatal("the blob was streamed")
+		}
+		if e.mock.countPrefix("probe/") != 0 {
+			t.Fatal("the probe left its object behind")
+		}
+	})
+
+	t.Run("the probe needs no permission to delete", func(t *testing.T) {
+		e := setup(t, S3DirectAddProbe, func(m *mockS3) {
+			m.deleteHook = func(*http.Request) int { return http.StatusForbidden }
+		})
+		if seen, _, err := add(e, "ns", data, size); err != nil || len(seen) != 0 {
+			t.Fatalf("add: %v, spool held %v; want it streamed", err, seen)
+		}
+		if e.mock.countPrefix("probe/") != 1 {
+			t.Fatal("want the probe object left behind")
+		}
+	})
+
+	t.Run("a probe without an answer is tried again", func(t *testing.T) {
+		var fail atomic.Bool
+		fail.Store(true)
+		e := setup(t, S3DirectAddProbe, func(m *mockS3) {
+			m.putHook = func(r *http.Request) int {
+				if fail.Load() && strings.Contains(r.URL.Path, "/probe/") {
+					return http.StatusServiceUnavailable
+				}
+				return 0
+			}
+		})
+		if seen, _, err := add(e, "a", data, size); err != nil || len(seen) != 1 {
+			t.Fatalf("add a: %v, spool held %v; want it spooled", err, seen)
+		}
+		fail.Store(false)
+		if seen, _, err := add(e, "b", data+"!", size+1); err != nil || len(seen) != 0 {
+			t.Fatalf("add b: %v, spool held %v; want it streamed", err, seen)
+		}
+	})
+
+	t.Run("always streams, and takes back what an ignoring service stored", func(t *testing.T) {
+		e := setup(t, S3DirectAddAlways, func(m *mockS3) { m.ignoreChecksum = true })
+		w := strings.NewReader(strings.ToUpper(data))
+		_, err := e.stores.Use("ns").Add(context.Background(), Meta{Digest: DigestFromBytes([]byte(data)), Size: size}, w)
+		if !errors.Is(err, ErrDigestMismatch) {
+			t.Fatalf("add: %v; want %v", err, ErrDigestMismatch)
+		}
+		if n := e.mock.count(); n != 0 {
+			t.Fatalf("bucket holds %d objects; want none", n)
+		}
+		if e.mock.countPrefix("probe/") != 0 || e.mock.unsignedPuts.Load() != 1 {
+			t.Fatal("always probed or did not stream")
+		}
+	})
+
+	t.Run("never streams", func(t *testing.T) {
+		e := setup(t, S3DirectAddNever, nil)
+		seen, _, err := add(e, "ns", data, size)
+		if err != nil || len(seen) != 1 {
+			t.Fatalf("add: %v, spool held %v; want it spooled", err, seen)
+		}
+	})
+
+	t.Run("an unknown mode is refused", func(t *testing.T) {
+		if _, err := NewS3Stores(S3Config{Bucket: "b", DirectAdd: S3DirectAddNever + 1}); err == nil {
+			t.Fatal("want an error")
+		}
+	})
+}
+
+func TestS3DirectAddCacheFill(t *testing.T) {
+	ctx := context.Background()
+	mock := newMockS3("flob-test")
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	primary, err := NewS3Stores(S3Config{
+		Endpoint:     srv.URL,
+		Region:       "us-east-1",
+		Bucket:       "flob-test",
+		Credentials:  Credentials{AccessKeyID: "AKIAEXAMPLE", SecretAccessKey: "secretexample"},
+		UsePathStyle: true,
+		Client:       srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("new s3 stores: %v", err)
+	}
+	origin := NewMemStores()
+	data := strings.Repeat("a layer from the origin ", 4096)
+	m, err := origin.Use("ns").Add(ctx, Meta{}, strings.NewReader(data))
+	if err != nil {
+		t.Fatalf("add to origin: %v", err)
+	}
+
+	cache := NewCacheStores(primary, origin).Use("ns")
+	r, _, err := cache.Open(ctx, m.Digest)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if got, err := io.ReadAll(r); err != nil || string(got) != data {
+		t.Fatalf("read: %v", err)
+	}
+	r.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := primary.Use("ns").Stat(ctx, m.Digest); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the fill did not reach the bucket")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if mock.unsignedPuts.Load() != 1 {
+		t.Fatal("the fill was not streamed")
+	}
 }
