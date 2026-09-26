@@ -24,7 +24,8 @@ type CacheStores struct {
 	Primary Stores
 	Origin  Stores
 	// FillTimeout bounds each cache write after its reader has delivered every
-	// byte. Nonpositive uses [DefaultCacheFillTimeout].
+	// byte or, into a [Filler] primary, once nobody reads or waits for it.
+	// Nonpositive uses [DefaultCacheFillTimeout].
 	FillTimeout time.Duration
 	flights     cacheFlights
 }
@@ -47,7 +48,8 @@ func (s *CacheStores) Use(id string) Store {
 type CacheStore struct {
 	Primary Store
 	Origin  Store
-	// FillTimeout bounds a cache write after its reader has delivered every byte.
+	// FillTimeout bounds a cache write after its reader has delivered every byte
+	// or, into a [Filler] primary, once nobody reads or waits for it.
 	// Nonpositive uses [DefaultCacheFillTimeout].
 	FillTimeout time.Duration
 	shared      *cacheFlights
@@ -55,7 +57,7 @@ type CacheStore struct {
 	local       cacheFlights
 }
 
-// DefaultCacheFillTimeout bounds a cache write that outlives its reader when
+// DefaultCacheFillTimeout bounds a cache write that outlives its readers when
 // FillTimeout is unset.
 const DefaultCacheFillTimeout = 15 * time.Minute
 
@@ -92,6 +94,15 @@ type cacheFlightKey struct {
 type cacheFlight struct {
 	done      chan struct{}
 	originErr error // Published by closing done.
+
+	// A flight into a [Filler] primary also publishes these by closing ready:
+	// the fill every caller follows, or why there is none.
+	ready    chan struct{}
+	fill     Fill
+	info     Info
+	startErr error // from the origin, or from Fill when originErr is false
+	fromFill bool
+	users    flightUsers
 }
 type cacheFlights struct {
 	mu     sync.Mutex
@@ -107,7 +118,7 @@ func (f *cacheFlights) join(key cacheFlightKey) (*cacheFlight, bool) {
 	if f.active == nil {
 		f.active = make(map[cacheFlightKey]*cacheFlight)
 	}
-	flight := &cacheFlight{done: make(chan struct{})}
+	flight := &cacheFlight{done: make(chan struct{}), ready: make(chan struct{})}
 	f.active[key] = flight
 	return flight, true
 }
@@ -122,12 +133,21 @@ func (f *cacheFlights) finish(key cacheFlightKey, flight *cacheFlight, err error
 	close(flight.done)
 }
 
-// Open reads the primary first. On a miss, one caller streams from the origin
-// while concurrent callers for the same namespace and digest wait for its cache
-// write to finish. Waiters can cancel independently. After an unsuccessful fill,
-// a waiter tries the origin once itself; ordinary origin Open errors are shared.
+// Open reads the primary first. On a miss, if the primary is a [Filler], one
+// flight per namespace and digest reads the origin into the primary, and every
+// caller, the first included, reads the blob as the primary receives it: from
+// its first byte, at the pace of the origin and the primary rather than of any
+// other caller. Callers come and go without affecting the fill; once nobody
+// reads or waits for it, it must finish within FillTimeout. A caller whose
+// fill fails partway continues from the origin at its own position. Ordinary
+// origin Open errors are shared.
 //
-// Caching completes when all bytes have been read in order. Size probes and
+// Otherwise, one caller streams from the origin while concurrent callers for
+// the same namespace and digest wait for its cache write to finish. Waiters can
+// cancel independently. After an unsuccessful fill, a waiter tries the origin
+// once itself; ordinary origin Open errors are shared.
+//
+// On that path, caching completes when all bytes have been read in order. Size probes and
 // rereads of an already-read prefix are supported; reading past a gap, closing
 // early, or canceling ctx before the last byte cancels the cache write and
 // releases waiters. Once every byte has been read, the write no longer depends on
@@ -147,6 +167,9 @@ func (s *CacheStore) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Inf
 		registry = &s.local
 	}
 	key := cacheFlightKey{namespace: s.namespace, digest: d}
+	if filler, ok := AsFiller(s.Primary); ok {
+		return s.openFill(ctx, registry, key, filler)
+	}
 	flight, leader := registry.join(key)
 	if !leader {
 		select {
@@ -260,6 +283,184 @@ func (s *CacheStore) openOrigin(ctx context.Context, d Digest, finish func(error
 		return nil, nil, err
 	}
 	return reader, info, nil
+}
+
+// openFill serves a miss from a flight into a [Filler] primary; see [CacheStore.Open].
+func (s *CacheStore) openFill(ctx context.Context, registry *cacheFlights, key cacheFlightKey, filler Filler) (io.ReadSeekCloser, Info, error) {
+	flight, leader := registry.join(key)
+	flight.users.join()
+	if leader {
+		timeout := s.FillTimeout
+		if timeout <= 0 {
+			timeout = DefaultCacheFillTimeout
+		}
+		go s.fly(ctx, func() { registry.finish(key, flight, nil) }, flight, key.digest, filler, timeout)
+	}
+
+	select {
+	case <-ctx.Done():
+		flight.users.leave()
+		return nil, nil, ctx.Err()
+	case <-flight.ready:
+	}
+	if flight.fill != nil {
+		if r, err := flight.fill.Follow(ctx); err == nil {
+			return &cacheFollower{r: r, ctx: ctx, origin: s.Origin, digest: key.digest, leave: flight.users.leave}, flight.info, nil
+		}
+		// The fill has ended with nobody reading it, so it is in the primary
+		// unless it failed.
+	}
+	flight.users.leave()
+	if flight.startErr != nil && !flight.fromFill {
+		return nil, nil, flight.startErr
+	}
+	if r, info, err := s.Primary.Open(ctx, key.digest); err == nil {
+		return r, info, nil
+	}
+	// The primary could not take the blob; serve it without caching.
+	return s.Origin.Open(ctx, key.digest)
+}
+
+// fly reads the origin into a fill of the primary, for as long as someone reads
+// or waits for it and, once nobody does, for up to timeout more.
+func (s *CacheStore) fly(ctx context.Context, finish func(), flight *cacheFlight, d Digest, filler Filler, timeout time.Duration) {
+	fillCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+	flight.users.idle(timeout, cancel)
+	defer flight.users.idle(0, nil)
+	// Leave the registry only once the blob is in the primary, or it has failed.
+	defer finish()
+	ready := sync.OnceFunc(func() { close(flight.ready) })
+	defer ready()
+
+	src, info, err := s.Origin.Open(fillCtx, d)
+	if err != nil {
+		flight.startErr = err
+		return
+	}
+	defer src.Close()
+	m, err := infoMeta(fillCtx, info)
+	if err != nil {
+		flight.startErr = err
+		return
+	}
+	fill, err := filler.Fill(fillCtx, m)
+	if err != nil {
+		flight.startErr, flight.fromFill = err, true
+		return
+	}
+	flight.fill, flight.info = fill, info
+	ready()
+
+	stop := context.AfterFunc(fillCtx, func() { src.Close() })
+	_, err = io.Copy(fill, io.LimitReader(src, m.Size))
+	stop()
+	if err == nil {
+		err = fillCtx.Err()
+	}
+	if err != nil {
+		fill.Abort(err)
+		return
+	}
+	_, err = fill.Commit(fillCtx)
+	fill.Abort(err)
+}
+
+// flightUsers counts the callers reading or waiting for a flight, and cancels
+// it once there have been none for a while.
+type flightUsers struct {
+	mu      sync.Mutex
+	n       int
+	timeout time.Duration
+	cancel  func()
+	timer   *time.Timer
+}
+
+// idle sets what happens when the last user leaves: cancel, after timeout. A
+// nil cancel stops watching.
+func (u *flightUsers) idle(timeout time.Duration, cancel func()) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.timeout, u.cancel = timeout, cancel
+	if u.timer != nil {
+		u.timer.Stop()
+		u.timer = nil
+	}
+	if cancel != nil && u.n == 0 {
+		u.timer = time.AfterFunc(timeout, cancel)
+	}
+}
+
+func (u *flightUsers) join() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.n++
+	if u.timer != nil {
+		u.timer.Stop()
+		u.timer = nil
+	}
+}
+
+func (u *flightUsers) leave() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.n--
+	if u.n == 0 && u.cancel != nil {
+		u.timer = time.AfterFunc(u.timeout, u.cancel)
+	}
+}
+
+// cacheFollower reads a fill and, if the fill fails partway, the origin from
+// where it stopped.
+type cacheFollower struct {
+	r       io.ReadSeekCloser
+	ctx     context.Context
+	origin  Store
+	digest  Digest
+	off     int64
+	resumed bool
+	leave   func()
+	once    sync.Once
+}
+
+func (f *cacheFollower) Read(b []byte) (int, error) {
+	n, err := f.r.Read(b)
+	f.off += int64(n)
+	if err == nil || err == io.EOF || f.resumed || errors.Is(err, ErrDigestMismatch) || f.ctx.Err() != nil {
+		return n, err
+	}
+	// The fill failed; what it wrote is still right, so continue from the origin.
+	r, _, oerr := f.origin.Open(f.ctx, f.digest)
+	if oerr != nil {
+		return n, err
+	}
+	if _, oerr := r.Seek(f.off, io.SeekStart); oerr != nil {
+		r.Close()
+		return n, err
+	}
+	f.r.Close()
+	f.r, f.resumed = r, true
+	if n > 0 {
+		return n, nil
+	}
+	return f.Read(b)
+}
+
+func (f *cacheFollower) Seek(offset int64, whence int) (int64, error) {
+	pos, err := f.r.Seek(offset, whence)
+	if err == nil {
+		f.off = pos
+	}
+	return pos, err
+}
+
+func (f *cacheFollower) Close() error {
+	var err error
+	f.once.Do(func() {
+		err = f.r.Close()
+		f.leave()
+	})
+	return err
 }
 
 type cacheReader struct {
