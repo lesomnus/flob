@@ -7,7 +7,8 @@ package flob
 //
 // Only the "Authorization header, single chunk" flavor is implemented, which is
 // all the S3 store needs: every request body is either empty or fully buffered,
-// so its SHA-256 is known before the request is sent.
+// so its SHA-256 is known before the request is sent, or is streamed as
+// UNSIGNED-PAYLOAD with the service checking x-amz-checksum-sha256 instead.
 
 import (
 	"crypto/hmac"
@@ -136,8 +137,9 @@ func (s signer) sign(req *http.Request, payloadHash string) {
 		"Signature="+signature)
 }
 
-// unsignedPayload is the x-amz-content-sha256 sentinel used for presigned URLs,
-// where the body hash is not known (and not signed) at URL-generation time.
+// unsignedPayload is the x-amz-content-sha256 sentinel for a body that is not
+// signed: presigned URLs, where it is not known at URL-generation time, and
+// streamed blobs, where it is known only once sent.
 const unsignedPayload = "UNSIGNED-PAYLOAD"
 
 // presignMaxExpiry is the SigV4 upper bound on X-Amz-Expires (7 days).
