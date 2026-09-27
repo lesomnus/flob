@@ -473,12 +473,20 @@ func flightAdd(t *testing.T, store Store, content string) Digest {
 	return m.Digest
 }
 
+// waitingStores hides its stores' [Filler], so a cache over it takes the path
+// where callers wait for the first caller's fill.
+type waitingStores struct{ Stores }
+
+func (s waitingStores) Use(id string) Store { return waitingStore{s.Stores.Use(id)} }
+
+type waitingStore struct{ Store }
+
 func TestCacheFlightRepeatedUse(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const content = "shared cache content"
 		origins := &flightTestOrigins{Stores: NewMemStores()}
 		d := flightAdd(t, origins.Stores.Use("t"), content)
-		cache := NewCacheStores(NewMemStores(), origins)
+		cache := NewCacheStores(waitingStores{NewMemStores()}, origins)
 		leader, _, err := cache.Use("t").Open(t.Context(), d)
 		if err != nil {
 			t.Fatal(err)
@@ -512,7 +520,7 @@ func TestCacheFlightIndependentKeys(t *testing.T) {
 		first := flightAdd(t, origins.Stores.Use("a"), "first")
 		second := flightAdd(t, origins.Stores.Use("a"), "second")
 		flightAdd(t, origins.Stores.Use("b"), "first")
-		cache := NewCacheStores(NewMemStores(), origins)
+		cache := NewCacheStores(waitingStores{NewMemStores()}, origins)
 		results := []<-chan flightOpenResult{flightOpen(t.Context(), cache.Use("a"), first), flightOpen(t.Context(), cache.Use("a"), second), flightOpen(t.Context(), cache.Use("b"), first)}
 		synctest.Wait()
 		flightActive(t, &cache.flights, 3)
@@ -565,7 +573,7 @@ func TestCacheFlightWaiterCancellation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		source := NewMemStores().Use("t")
 		d := flightAdd(t, source, "content")
-		cache := NewCacheStore(NewMemStores().Use("t"), source)
+		cache := NewCacheStore(waitingStore{NewMemStores().Use("t")}, source)
 		leader, _, err := cache.Open(t.Context(), d)
 		if err != nil {
 			t.Fatal(err)
@@ -592,7 +600,7 @@ func TestCacheFlightPartialLeader(t *testing.T) {
 				const content = "0123456789"
 				origins := &flightTestOrigins{Stores: NewMemStores()}
 				d := flightAdd(t, origins.Stores.Use("t"), content)
-				cache := NewCacheStores(NewMemStores(), origins)
+				cache := NewCacheStores(waitingStores{NewMemStores()}, origins)
 				leader, _, err := cache.Use("t").Open(t.Context(), d)
 				if err != nil {
 					t.Fatal(err)
@@ -917,7 +925,7 @@ func TestCacheFlightLeaderCancellationClosesSource(t *testing.T) {
 			}
 			return source.Open(ctx, d)
 		}}
-		cache := NewCacheStore(NewMemStores().Use("t"), origin)
+		cache := NewCacheStore(waitingStore{NewMemStores().Use("t")}, origin)
 		ctx, cancel := context.WithCancel(t.Context())
 		leader, _, err := cache.Open(ctx, d)
 		if err != nil {

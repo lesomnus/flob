@@ -83,6 +83,80 @@ func (s *MemStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	return s.publish(m, data)
 }
 
+var _ Filler = (*MemStore)(nil)
+
+// Fill begins adding a blob that can be read while it is written; see
+// [Filler]. Its bytes are the ones the store keeps once it commits.
+func (s *MemStore) Fill(ctx context.Context, m Meta) (Fill, error) {
+	d, err := m.Digest.Sanitize()
+	if err != nil {
+		return nil, err
+	}
+	m.Digest = d
+	if _, ok := s.es.Load(d); ok {
+		return nil, ErrAlreadyExists
+	}
+	f := &memFill{s: s, m: m, data: make([]byte, 0, min(m.Size, 1<<20))}
+	t, err := newFillTracker(m, f, nil)
+	if err != nil {
+		return nil, err
+	}
+	f.t = t
+	return f, nil
+}
+
+type memFill struct {
+	s *MemStore
+	m Meta
+	t *fillTracker
+
+	mu   sync.RWMutex
+	data []byte
+}
+
+func (f *memFill) Write(p []byte) (int, error) {
+	return f.t.write(p, func(p []byte) (int, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.data = append(f.data, p...)
+		return len(p), nil
+	})
+}
+
+func (f *memFill) ReadAt(p []byte, off int64) (int, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if off >= int64(len(f.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (f *memFill) Follow(ctx context.Context) (io.ReadSeekCloser, error) {
+	return f.t.follow(ctx)
+}
+
+func (f *memFill) Commit(ctx context.Context) (Meta, error) {
+	defer f.t.end()
+	if err := f.t.complete(); err != nil {
+		return f.m, err
+	}
+	f.mu.RLock()
+	data := f.data
+	f.mu.RUnlock()
+	m := f.m
+	m.Size = int64(len(data))
+	return f.s.publish(m, data)
+}
+
+func (f *memFill) Abort(err error) {
+	f.t.abort(err)
+}
+
 // publish installs already verified immutable bytes and retains Add's duplicate
 // behavior. Staged commits use the same publication path without rehashing.
 func (s *MemStore) publish(m Meta, data []byte) (Meta, error) {

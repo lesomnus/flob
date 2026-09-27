@@ -145,6 +145,14 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 	} else if m.Digest != d {
 		return m, ErrDigestMismatch
 	}
+	return s.publish(ctx, m, tf)
+}
+
+// publish adds the blob m.Digest, verified and m.Size bytes long, reading it
+// from blob.
+func (s OsStore) publish(ctx context.Context, m Meta, blob io.Reader) (Meta, error) {
+	d := m.Digest
+	pb := s.pathToRepo(d, "blob")
 
 	// We decided to add the blob, so acquire the lock to prevent concurrent Add
 	// or Erase with the same digest.
@@ -211,7 +219,7 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 		}
 		defer bf.Close()
 
-		if _, err := io.Copy(bf, tf); err != nil {
+		if _, err := io.Copy(bf, blob); err != nil {
 			return m, fmt.Errorf("copy blob: %w", err)
 		}
 
@@ -238,6 +246,69 @@ func (s OsStore) Add(ctx context.Context, m Meta, r io.Reader) (Meta, error) {
 
 	ok = true
 	return m, nil
+}
+
+var _ Filler = OsStore{}
+
+// Fill begins adding a blob that can be read while it is written; see
+// [Filler]. It is written to a temp file inside the store, as Add writes one,
+// and readers read that file.
+func (s OsStore) Fill(ctx context.Context, m Meta) (Fill, error) {
+	d, err := m.Digest.Sanitize()
+	if err != nil {
+		return nil, err
+	}
+	m.Digest = d
+	if err := s.checkDup(s.pathToRepo(d, "blob")); err != nil {
+		return nil, err
+	}
+
+	pt, err := s.ensureStagePath()
+	if err != nil {
+		return nil, fmt.Errorf("ensure stage path: %w", err)
+	}
+	tf, err := os.CreateTemp(pt, "flob-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp: %w", err)
+	}
+	release := func() {
+		tf.Close()
+		os.Remove(tf.Name())
+	}
+	t, err := newFillTracker(m, tf, release)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return &osFill{s: s, m: m, tf: tf, t: t}, nil
+}
+
+type osFill struct {
+	s  OsStore
+	m  Meta
+	tf *os.File
+	t  *fillTracker
+}
+
+func (f *osFill) Write(p []byte) (int, error) {
+	return f.t.write(p, f.tf.Write)
+}
+
+func (f *osFill) Follow(ctx context.Context) (io.ReadSeekCloser, error) {
+	return f.t.follow(ctx)
+}
+
+func (f *osFill) Commit(ctx context.Context) (Meta, error) {
+	defer f.t.end()
+	if err := f.t.complete(); err != nil {
+		return f.m, err
+	}
+	// Readers read the file at their own offsets, so it is read here the same way.
+	return f.s.publish(ctx, f.m, io.NewSectionReader(f.tf, 0, f.m.Size))
+}
+
+func (f *osFill) Abort(err error) {
+	f.t.abort(err)
 }
 
 // stampEntry records the publication time on a staged digest directory just before
