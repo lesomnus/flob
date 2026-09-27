@@ -60,6 +60,14 @@ jobs:
             *.cache-from=type=gha
             *.cache-to=type=gha,mode=max
 
+      - name: Keep binaries for the edge release
+        uses: actions/upload-artifact@v7
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        with:
+          name: binaries
+          path: output/
+          retention-days: 1
+
       - name: Login to GHCR
         uses: docker/login-action@v4
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -79,3 +87,46 @@ jobs:
             package.platform=linux/amd64
             package.platform=linux/arm64
             package.output=type=registry
+
+  # main 의 바이너리를 "edge" 릴리스 하나에 계속 덮어쓴다: 태그를 새 커밋으로 옮기고
+  # 같은 이름의 첨부를 교체한다. 다운로드 주소가 고정된다:
+  #   https://github.com/<repo>/releases/download/edge/flob-linux-amd64
+  edge:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: edge-release
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries
+          path: output
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 늦게 끝난 옛 run 이 새 바이너리를 덮어쓰지 않게, main 이 아직 이 커밋일 때만 게시한다.
+          head="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "main is at $head now, not $GITHUB_SHA; leaving edge to that run"
+            exit 0
+          fi
+
+          mkdir dist
+          cp output/amd64 dist/flob-linux-amd64
+          cp output/arm64 dist/flob-linux-arm64
+          (cd dist && sha256sum * > SHA256SUMS)
+
+          git tag -f edge "$GITHUB_SHA"
+          git push -f origin refs/tags/edge
+
+          if ! gh release view edge >/dev/null 2>&1; then
+            gh release create edge --prerelease --latest=false --title edge --notes ""
+          fi
+          gh release edit edge --prerelease --latest=false --notes "Built from ${GITHUB_SHA} on main by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. Replaced on every push to main."
+          gh release upload edge dist/* --clobber
