@@ -626,8 +626,33 @@ type OsFileLock struct {
 }
 
 func (l OsFileLock) Lock(ctx context.Context) error {
-	_, err := l.lock.TryLockContext(ctx, 100*time.Millisecond)
+	_, err := tryLockContext(ctx, l.lock.TryLock)
 	return err
+}
+
+// A contended file lock is tried again after lockRetryMin at first, since
+// most holders are done within a few milliseconds, then after twice as long
+// each time, up to lockRetryMax.
+const (
+	lockRetryMin = time.Millisecond
+	lockRetryMax = 100 * time.Millisecond
+)
+
+// tryLockContext calls try until it takes the lock, fails, or ctx is done.
+func tryLockContext(ctx context.Context, try func() (bool, error)) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	for delay := lockRetryMin; ; delay = min(delay*2, lockRetryMax) {
+		if ok, err := try(); ok || err != nil {
+			return ok, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
 }
 
 func (l OsFileLock) TryLock(ctx context.Context) (bool, error) {
@@ -932,7 +957,7 @@ func (s OsStore) Begin(ctx context.Context, algo digest.Algorithm) (Stage, error
 		}
 	}
 	lock := flock.New(filepath.Join(s.root, path, "lock"), flock.SetFlag(os.O_RDWR))
-	if _, err := lock.TryLockContext(ctx, 10*time.Millisecond); err != nil {
+	if _, err := tryLockContext(ctx, lock.TryLock); err != nil {
 		return nil, err
 	}
 	defer lock.Close()
@@ -1049,7 +1074,7 @@ func openOsStage(ctx context.Context, path, id string, namespace *string, cfg St
 			return nil, ErrStageConflict
 		}
 	} else {
-		if _, err := lock.TryLockContext(ctx, 10*time.Millisecond); err != nil {
+		if _, err := tryLockContext(ctx, lock.TryLock); err != nil {
 			return nil, osStageError(err)
 		}
 	}

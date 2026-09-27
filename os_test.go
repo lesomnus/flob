@@ -10,10 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -1023,4 +1025,68 @@ func TestOsStageOperationTimeout(t *testing.T) {
 	if _, err := stage.Stat(t.Context()); err != nil {
 		t.Fatalf("lock not reusable after timeout: %v", err)
 	}
+}
+
+func TestOsLockRetry(t *testing.T) {
+	t.Run("tries again sooner at first", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			start := time.Now()
+			var at []time.Duration
+			ok, err := tryLockContext(t.Context(), func() (bool, error) {
+				at = append(at, time.Since(start))
+				return len(at) == 10, nil
+			})
+			if !ok || err != nil {
+				t.Fatalf("lock = %v, %v", ok, err)
+			}
+			want := []time.Duration{0, 1, 3, 7, 15, 31, 63, 127, 227, 327}
+			for i := range want {
+				want[i] *= time.Millisecond
+			}
+			if !reflect.DeepEqual(at, want) {
+				t.Fatalf("tried at %v; want %v", at, want)
+			}
+		})
+	})
+
+	t.Run("stops with its context", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			ok, err := tryLockContext(ctx, func() (bool, error) { return false, nil })
+			if ok || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("lock = %v, %v; want %v", ok, err, context.DeadlineExceeded)
+			}
+		})
+	})
+
+	t.Run("a lock held briefly is not waited for long", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			locker := NewOsFileLocker(t.TempDir())
+			holder, err := locker.New("d")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := holder.Lock(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			go func() {
+				time.Sleep(5 * time.Millisecond)
+				holder.Unlock(t.Context())
+			}()
+
+			waiter, err := locker.New("d")
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now()
+			if err := waiter.Lock(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			defer waiter.Unlock(t.Context())
+			if waited := time.Since(start); waited > 10*time.Millisecond {
+				t.Fatalf("waited %v for a lock held 5ms", waited)
+			}
+		})
+	})
 }
