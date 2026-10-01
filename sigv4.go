@@ -11,9 +11,11 @@ package flob
 // UNSIGNED-PAYLOAD with the service checking x-amz-checksum-sha256 instead.
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -29,15 +31,44 @@ const emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca49599
 
 // Credentials holds the access key used to sign S3 requests. SessionToken is
 // optional and only set for temporary (STS) credentials.
+//
+// Credentials is itself a [CredentialsProvider] that always gives itself, which
+// is how a fixed set is configured.
 type Credentials struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	SessionToken    string
+	// Expires is when these credentials stop working; zero is never. A
+	// signature is refused once it has passed, and a presigned URL is not made
+	// to outlive it.
+	Expires time.Time
+}
+
+// Retrieve implements [CredentialsProvider] by returning c.
+func (c Credentials) Retrieve(context.Context) (Credentials, error) {
+	return c, nil
+}
+
+// CredentialsProvider gives the credentials to sign with. It is asked before
+// each signature, presigned URLs included, and from many goroutines at once, so
+// it must be safe for concurrent use and should be cheap. The returned set is
+// used whole for that one signature, so a provider that rotates keys never has
+// a new key id mixed with an old secret. An error fails the request.
+type CredentialsProvider interface {
+	Retrieve(ctx context.Context) (Credentials, error)
+}
+
+// CredentialsFunc adapts a function to a [CredentialsProvider].
+type CredentialsFunc func(ctx context.Context) (Credentials, error)
+
+// Retrieve implements [CredentialsProvider] by calling f.
+func (f CredentialsFunc) Retrieve(ctx context.Context) (Credentials, error) {
+	return f(ctx)
 }
 
 // signer computes SigV4 signatures for a fixed region and service.
 type signer struct {
-	creds   Credentials
+	creds   CredentialsProvider // nil signs with Credentials{}
 	region  string
 	service string // always "s3" here
 	now     func() time.Time
@@ -56,8 +87,24 @@ var headersNotSigned = map[string]bool{
 	"x-amzn-trace-id": true,
 }
 
-// sign signs req in place. It sets X-Amz-Date, X-Amz-Content-Sha256, the
-// Authorization header, and (when present) X-Amz-Security-Token. The canonical
+// retrieve asks the provider for the credentials to sign with at t.
+func (s signer) retrieve(ctx context.Context, t time.Time) (Credentials, error) {
+	if s.creds == nil {
+		return Credentials{}, nil
+	}
+	c, err := s.creds.Retrieve(ctx)
+	if err != nil {
+		return Credentials{}, fmt.Errorf("s3: credentials: %w", err)
+	}
+	if !c.Expires.IsZero() && !t.Before(c.Expires) {
+		return Credentials{}, fmt.Errorf("s3: credentials: expired at %s", c.Expires.UTC().Format(time.RFC3339))
+	}
+	return c, nil
+}
+
+// sign signs req in place, with credentials asked for under req's context. It
+// sets X-Amz-Date, X-Amz-Content-Sha256, the Authorization header, and (when
+// present) X-Amz-Security-Token. The canonical
 // URI is taken from req.URL.Opaque and the canonical query from req.URL.RawQuery,
 // so the signed request line is byte-for-byte what the transport puts on the
 // wire; the caller is responsible for having set those to their SigV4-encoded
@@ -67,15 +114,19 @@ var headersNotSigned = map[string]bool{
 // All non-excluded headers already on req are signed, so any header that must be
 // covered by the signature (notably x-amz-meta-*) has to be set before calling
 // sign.
-func (s signer) sign(req *http.Request, payloadHash string) {
+func (s signer) sign(req *http.Request, payloadHash string) error {
 	t := s.now().UTC()
+	creds, err := s.retrieve(req.Context(), t)
+	if err != nil {
+		return err
+	}
 	amzDate := t.Format("20060102T150405Z")
 	dateStamp := t.Format("20060102")
 
 	req.Header.Set("X-Amz-Date", amzDate)
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
-	if s.creds.SessionToken != "" {
-		req.Header.Set("X-Amz-Security-Token", s.creds.SessionToken)
+	if creds.SessionToken != "" {
+		req.Header.Set("X-Amz-Security-Token", creds.SessionToken)
 	}
 
 	host := req.URL.Host
@@ -129,12 +180,13 @@ func (s signer) sign(req *http.Request, payloadHash string) {
 		hexSHA256([]byte(canonicalRequest)),
 	}, "\n")
 
-	signature := hex.EncodeToString(hmacSHA256(s.signingKey(dateStamp), stringToSign))
+	signature := hex.EncodeToString(hmacSHA256(s.signingKey(creds, dateStamp), stringToSign))
 
 	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 "+
-		"Credential="+s.creds.AccessKeyID+"/"+scope+", "+
+		"Credential="+creds.AccessKeyID+"/"+scope+", "+
 		"SignedHeaders="+signedHeaders+", "+
 		"Signature="+signature)
+	return nil
 }
 
 // unsignedPayload is the x-amz-content-sha256 sentinel for a body that is not
@@ -150,13 +202,22 @@ const presignMaxExpiry = 7 * 24 * time.Hour
 // appended. canonicalURI is the SigV4-encoded request path (as produced for
 // [signer.sign] via req.URL.Opaque); host is the value bound into the sole signed
 // header. Only the host header is signed, so the resulting URL needs no extra
-// request headers to remain valid. expires is clamped to [1s, presignMaxExpiry].
-func (s signer) presignQuery(method, canonicalURI, host string, expires time.Duration) string {
+// request headers to remain valid. expires is first cut to what is left of the
+// credentials' lifetime, since the URL stops working with them, then clamped to
+// [1s, presignMaxExpiry].
+func (s signer) presignQuery(ctx context.Context, method, canonicalURI, host string, expires time.Duration) (string, error) {
 	t := s.now().UTC()
+	creds, err := s.retrieve(ctx, t)
+	if err != nil {
+		return "", err
+	}
 	amzDate := t.Format("20060102T150405Z")
 	dateStamp := t.Format("20060102")
 	scope := dateStamp + "/" + s.region + "/" + s.service + "/aws4_request"
 
+	if !creds.Expires.IsZero() {
+		expires = min(expires, creds.Expires.Sub(t))
+	}
 	if expires < time.Second {
 		expires = time.Second
 	} else if expires > presignMaxExpiry {
@@ -165,12 +226,12 @@ func (s signer) presignQuery(method, canonicalURI, host string, expires time.Dur
 
 	q := url.Values{}
 	q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
-	q.Set("X-Amz-Credential", s.creds.AccessKeyID+"/"+scope)
+	q.Set("X-Amz-Credential", creds.AccessKeyID+"/"+scope)
 	q.Set("X-Amz-Date", amzDate)
 	q.Set("X-Amz-Expires", strconv.FormatInt(int64(expires.Seconds()), 10))
 	q.Set("X-Amz-SignedHeaders", "host")
-	if s.creds.SessionToken != "" {
-		q.Set("X-Amz-Security-Token", s.creds.SessionToken)
+	if creds.SessionToken != "" {
+		q.Set("X-Amz-Security-Token", creds.SessionToken)
 	}
 	canonicalQueryString := canonicalQuery(q)
 
@@ -190,13 +251,13 @@ func (s signer) presignQuery(method, canonicalURI, host string, expires time.Dur
 		hexSHA256([]byte(canonicalRequest)),
 	}, "\n")
 
-	signature := hex.EncodeToString(hmacSHA256(s.signingKey(dateStamp), stringToSign))
-	return canonicalQueryString + "&X-Amz-Signature=" + signature
+	signature := hex.EncodeToString(hmacSHA256(s.signingKey(creds, dateStamp), stringToSign))
+	return canonicalQueryString + "&X-Amz-Signature=" + signature, nil
 }
 
-// signingKey derives the date/region/service-scoped signing key.
-func (s signer) signingKey(dateStamp string) []byte {
-	kDate := hmacSHA256([]byte("AWS4"+s.creds.SecretAccessKey), dateStamp)
+// signingKey derives the date/region/service-scoped signing key for creds.
+func (s signer) signingKey(creds Credentials, dateStamp string) []byte {
+	kDate := hmacSHA256([]byte("AWS4"+creds.SecretAccessKey), dateStamp)
 	kRegion := hmacSHA256(kDate, s.region)
 	kService := hmacSHA256(kRegion, s.service)
 	return hmacSHA256(kService, "aws4_request")

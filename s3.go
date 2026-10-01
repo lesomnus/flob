@@ -77,8 +77,11 @@ type S3Config struct {
 	// Prefix is an optional key prefix within the bucket, letting several flob
 	// deployments share one bucket. A trailing "/" is added if missing.
 	Prefix string
-	// Credentials authenticate requests. Required for private buckets.
-	Credentials Credentials
+	// Credentials authenticate requests. Required for private buckets. A
+	// fixed set is given as a [Credentials] value; a set that is replaced
+	// while running, such as temporary (STS) credentials, as a provider asked
+	// before each signature (see [CredentialsFunc]). Nil is [Credentials]{}.
+	Credentials CredentialsProvider
 	// UsePathStyle selects path-style addressing (host/bucket/key) instead of
 	// virtual-hosted style (bucket.host/key). Required for MinIO and most
 	// S3-compatible servers.
@@ -247,7 +250,7 @@ func (s *S3Stores) refPrefix(id string) string {
 // presignGet builds a presigned GET URL for an in-bucket key, valid for ttl. It
 // uses the public endpoint so the URL is reachable directly by clients, and it
 // signs the exact host+path the client will request.
-func (s *S3Stores) presignGet(key string, ttl time.Duration) string {
+func (s *S3Stores) presignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	scheme, host := s.pubScheme, s.pubHost
 	rawPath := "/" + key
 	if s.pathStyle {
@@ -256,8 +259,11 @@ func (s *S3Stores) presignGet(key string, ttl time.Duration) string {
 		host = s.bucket + "." + host
 	}
 	canonicalURI := awsURIEncode(rawPath, false)
-	query := s.signer.presignQuery(http.MethodGet, canonicalURI, host, ttl)
-	return scheme + "://" + host + canonicalURI + "?" + query
+	query, err := s.signer.presignQuery(ctx, http.MethodGet, canonicalURI, host, ttl)
+	if err != nil {
+		return "", err
+	}
+	return scheme + "://" + host + canonicalURI + "?" + query, nil
 }
 
 // newRequest builds an unsigned request for an in-bucket key ("" addresses the
@@ -285,7 +291,9 @@ func (s *S3Stores) newRequest(ctx context.Context, method, key string, query url
 
 // send signs and dispatches req.
 func (s *S3Stores) send(req *http.Request, payloadHash string) (*http.Response, error) {
-	s.signer.sign(req, payloadHash)
+	if err := s.signer.sign(req, payloadHash); err != nil {
+		return nil, err
+	}
 	return s.cl.Do(req)
 }
 
@@ -794,7 +802,10 @@ func (s *S3Store) PresignOpen(ctx context.Context, d Digest, ttl time.Duration) 
 	labels, size := metaToLabels(hres.Header)
 	hres.Body.Close()
 
-	loc := s.stores.presignGet(s.stores.blobKey(d), ttl)
+	loc, err := s.stores.presignGet(ctx, s.stores.blobKey(d), ttl)
+	if err != nil {
+		return "", Meta{}, err
+	}
 	return loc, Meta{Digest: d, Size: size, Labels: labels}, nil
 }
 
