@@ -110,6 +110,34 @@ origin-only blobs cannot be linked through them. Decorator policies on `Add`
 (such as `AllowDuplicates`) do not change `Link` behavior. HTTP does not expose a
 link endpoint or `Linker` capability.
 
+## Adopt a file into the filesystem store
+
+`OsStore.Adopt` publishes a file that is already on the store's filesystem,
+such as another registry's blob, by hard link instead of a copy. The entry it
+leaves is like one `Add` leaves:
+
+```go
+store := stores.Use("library/alpine").(flob.OsStore)
+meta, err := store.Adopt(ctx, flob.Meta{Digest: digest, Labels: labels}, path, flob.AdoptOptions{
+    Added: storedAt, // zero is now
+})
+```
+
+When the store already holds the digest, the entry links to that copy and
+`path` is not linked. Otherwise `path`'s inode becomes the store's one copy, and
+a later `Add` of the digest in any namespace links to it. Without
+`AdoptOptions.Verify`, a file that is not the digest is therefore what every
+namespace serves for it. Verify hashes the file and returns `ErrDigestMismatch`.
+
+The file is pinned by a link before it is read, symlinks are not followed, and
+its owner and mode are left as they are. The source must not rewrite the file
+in place; removing it, or erasing the entry, leaves the other. An existing entry
+returns `ErrAlreadyExists`. A failed link is returned wrapped:
+`syscall.EXDEV` for another filesystem (separate ZFS datasets included), and
+`fs.ErrPermission` for a file the process may not link, as
+`fs.protected_hardlinks` refuses one it neither owns nor can read and write.
+`Add` is the fallback for both.
+
 ## Namespace IDs
 
 `Use(id)` identifies a namespace by the exact bytes of `id`. OS directory names,

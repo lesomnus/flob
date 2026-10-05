@@ -765,6 +765,198 @@ func (s OsStore) Link(ctx context.Context, d Digest, from Store) (Meta, error) {
 	return m.Clone(), nil
 }
 
+// AdoptOptions configures [OsStore.Adopt].
+type AdoptOptions struct {
+	// Added stamps the entry, for [Info.Added]; zero is now. A migration
+	// carries over when the source registry stored the blob.
+	Added time.Time
+	// Verify hashes the file and refuses one that is not m.Digest with
+	// [ErrDigestMismatch]. Without it, the file is taken to be m.Digest; see
+	// [OsStore.Adopt] for what a wrong one affects.
+	Verify bool
+}
+
+// Adopt publishes the regular file at path as blob m.Digest in this namespace
+// by hard link, without copying it, with m.Labels as its labels. It is for
+// taking in blobs that are already files on the store's filesystem, such as
+// another registry's, the way [OsStore.Add] publishes one it has read: what it
+// leaves is an entry like any other.
+//
+// The store keeps one inode per digest. When it already holds m.Digest in any
+// namespace, the entry links to that inode and path is not linked. Otherwise
+// path's inode becomes the store's copy, shared with the source and with every
+// namespace that adds the digest later: an [OsStore.Add] of the same digest
+// links to it rather than keep its own bytes. A file adopted without
+// [AdoptOptions.Verify] that is not m.Digest is therefore what every
+// namespace serves for that digest.
+//
+// The file is linked into a stage before it is read, so its size and, with
+// Verify, its digest are read from that link: a path replaced meanwhile cannot
+// publish other bytes. Symlinks are not followed. flob does not change the
+// file's owner or mode, which it shares with the source, and the source must
+// not rewrite the file in place. Removing the source's link, and an
+// [OsStore.Erase] of the entry, leave the other in place.
+//
+// An existing entry returns [ErrAlreadyExists], so adopting again changes
+// nothing. A failed link is returned wrapped: a path on another filesystem
+// (separate ZFS datasets included) is syscall.EXDEV, and a file the process may
+// not link, as fs.protected_hardlinks refuses one it neither owns nor can read
+// and write, is [fs.ErrPermission]. A caller can fall back to Add for either.
+func (s OsStore) Adopt(ctx context.Context, m Meta, path string, opts AdoptOptions) (Meta, error) {
+	if err := ctx.Err(); err != nil {
+		return Meta{}, err
+	}
+	d, err := m.Digest.Sanitize()
+	if err != nil {
+		return Meta{}, err
+	}
+	m = Meta{Digest: d, Labels: m.Labels.Clone()}
+	if err := osAdoptRegular(path); err != nil {
+		return m, err
+	}
+	pb := s.pathToRepo(d, "blob")
+	if err := s.checkDup(pb); err != nil {
+		return m, err
+	}
+
+	unlock, err := s.lockBlob(ctx, d)
+	if err != nil {
+		return m, err
+	}
+	defer unlock(ctx)
+	if err := s.checkDup(pb); err != nil {
+		return m, err
+	}
+
+	stageRoot, err := s.ensureStagePath()
+	if err != nil {
+		return m, fmt.Errorf("ensure stage path: %w", err)
+	}
+	stage, err := os.MkdirTemp(stageRoot, "adopt-*")
+	if err != nil {
+		return m, fmt.Errorf("create adopt stage: %w", err)
+	}
+	defer os.RemoveAll(stage)
+
+	labels, err := os.Create(filepath.Join(stage, "labels"))
+	if err != nil {
+		return m, fmt.Errorf("create labels: %w", err)
+	}
+	if err := writeLabels(labels, m.Labels); err != nil {
+		labels.Close()
+		return m, fmt.Errorf("write labels: %w", err)
+	}
+	if err := labels.Close(); err != nil {
+		return m, fmt.Errorf("close labels: %w", err)
+	}
+
+	// Pin the source before reading it.
+	source := filepath.Join(stage, "source")
+	if err := os.Link(path, source); err != nil {
+		return m, fmt.Errorf("link source: %w", err)
+	}
+	if err := osAdoptRegular(source); err != nil {
+		return m, err
+	}
+	if opts.Verify {
+		if err := osAdoptVerify(ctx, source, d); err != nil {
+			return m, err
+		}
+	}
+
+	staged := filepath.Join(stage, "blob")
+	pd := s.pathToBlob(d)
+	if _, err := os.Stat(pd); err == nil {
+		// The store already has this digest: keep its inode, not the source's.
+		if err := os.Link(pd, staged); err != nil {
+			return m, fmt.Errorf("link blob: %w", err)
+		}
+		if err := os.Remove(source); err != nil {
+			return m, fmt.Errorf("unlink source: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return m, fmt.Errorf("stat blob: %w", err)
+	} else {
+		if err := os.Rename(source, staged); err != nil {
+			return m, fmt.Errorf("stage source: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(pd), 0o755); err != nil {
+			return m, fmt.Errorf("mkdir blob dir: %w", err)
+		}
+		if err := os.Link(staged, pd); err != nil {
+			return m, fmt.Errorf("link blob to global path: %w", err)
+		}
+	}
+	info, err := os.Stat(staged)
+	if err != nil {
+		return m, fmt.Errorf("stat staged blob: %w", err)
+	}
+	m.Size = info.Size()
+
+	if err := ctx.Err(); err != nil {
+		return m, err
+	}
+	destination := s.pathToRepo(d)
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return m, fmt.Errorf("mkdir destination: %w", err)
+	}
+	added := opts.Added
+	if added.IsZero() {
+		added = time.Now()
+	}
+	if err := os.Chtimes(stage, added, added); err != nil {
+		return m, fmt.Errorf("stamp entry: %w", err)
+	}
+	if err := s.moveStageToRepo(stage, destination); err != nil {
+		return m, err
+	}
+	return m.Clone(), nil
+}
+
+// osAdoptRegular refuses a path [OsStore.Adopt] cannot take: anything but a
+// regular file, symlinks included.
+func osAdoptRegular(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("stat source: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("adopt %s: not a regular file (%s)", path, info.Mode().Type())
+	}
+	return nil
+}
+
+// osAdoptVerify hashes the file at path and reports [ErrDigestMismatch] unless
+// it is d.
+func osAdoptVerify(ctx context.Context, path string, d Digest) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open source: %w", err)
+	}
+	defer f.Close()
+	h := d.Algorithm().Hash()
+	if _, err := io.Copy(h, osCtxReader{ctx, f}); err != nil {
+		return fmt.Errorf("hash source: %w", err)
+	}
+	if Digest(fmt.Sprintf("%s:%x", d.Algorithm(), h.Sum(nil))) != d {
+		return ErrDigestMismatch
+	}
+	return nil
+}
+
+// osCtxReader stops a long read once ctx is done.
+type osCtxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r osCtxReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
 var (
 	_ Walker     = OsStore{}
 	_ Namespacer = OsStores{}
