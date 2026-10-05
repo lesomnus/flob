@@ -711,6 +711,55 @@ func TestOsStageRecoversPublishedCommit(t *testing.T) {
 	}
 }
 
+func TestOsStageCommitOntoEntryWithoutLabels(t *testing.T) {
+	// An entry flob did not write, such as one migrated from another registry,
+	// has no labels file; a commit of the same digest returns it as it is.
+	for _, mode := range []string{"labels missing", "labels not a regular file"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			stores := NewOsStores(root)
+			added, err := stores.Use("t").Add(t.Context(), Meta{}, strings.NewReader("content"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			labels := stores.Use("t").(OsStore).pathToRepo(added.Digest, "labels")
+			if err := os.Remove(labels); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "labels not a regular file" {
+				if err := os.Mkdir(labels, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			stage := osStageTestBegin(t, stores, "t", Canonical)
+			if _, err := stage.Append(t.Context(), 0, strings.NewReader("content")); err != nil {
+				t.Fatal(err)
+			}
+			m, err := stage.Commit(t.Context(), Meta{Labels: Labels{"Owner": {"stage"}}})
+			if mode == "labels not a regular file" {
+				if !errors.Is(err, ErrStageFormat) {
+					t.Fatalf("Commit = %#v, %v; want ErrStageFormat", m, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Commit = %v", err)
+			}
+			if m.Digest != added.Digest || m.Size != added.Size || len(m.Labels) != 0 {
+				t.Fatalf("Commit = %#v; want the existing entry %#v without labels", m, added)
+			}
+			if _, err := os.Lstat(labels); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Commit wrote labels into the existing entry: %v", err)
+			}
+			got, err := statMeta(t.Context(), stores.Use("t"), added.Digest)
+			if err != nil || len(got.Labels) != 0 {
+				t.Fatalf("Stat after commit = %#v, %v", got, err)
+			}
+		})
+	}
+}
+
 type osStageBlockingReader struct {
 	entered chan struct{}
 	release chan struct{}

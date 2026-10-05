@@ -1110,6 +1110,18 @@ func osStageRegular(root *os.Root, path string) error {
 	}
 	return nil
 }
+
+// osStageOptionalRegular is [osStageRegular] for a file that may be absent: it
+// reports whether path exists, and a path that exists must be a regular file.
+func osStageOptionalRegular(root *os.Root, path string) (bool, error) {
+	if err := osStageRegular(root, path); err != nil {
+		if errors.Is(err, ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
 func osStageReadRecord(dir *os.Root) (stageRecord, error) {
 	if err := osStageRegular(dir, "manifest"); err != nil {
 		return stageRecord{}, err
@@ -1417,6 +1429,10 @@ func (s *osStage) recoverCommit(l *osLockedStage) (Meta, error) {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return Meta{}, err
 	}
+	// The entry's files to make durable. An entry flob did not write, such as
+	// one migrated from another registry, may have no labels, which reads as
+	// no labels; the commit leaves it so rather than write into that entry.
+	durable := []string{"blob", "labels"}
 	if err := osStageRegular(l.root, filepath.Join(destination, "blob")); err == nil {
 		info, err := s.store.Stat(l.ctx, m.Digest)
 		if err != nil {
@@ -1429,8 +1445,12 @@ func (s *osStage) recoverCommit(l *osLockedStage) (Meta, error) {
 		if size != l.record.Offset {
 			return Meta{}, ErrStageFormat
 		}
-		if err := osStageRegular(l.root, filepath.Join(destination, "labels")); err != nil {
+		hasLabels, err := osStageOptionalRegular(l.root, filepath.Join(destination, "labels"))
+		if err != nil {
 			return Meta{}, err
+		}
+		if !hasLabels {
+			durable = []string{"blob"}
 		}
 		m, err = infoMeta(l.ctx, info)
 		if err != nil {
@@ -1509,7 +1529,7 @@ func (s *osStage) recoverCommit(l *osLockedStage) (Meta, error) {
 			return Meta{}, err
 		}
 	}
-	for _, name := range []string{"blob", "labels"} {
+	for _, name := range durable {
 		file, err := l.root.Open(filepath.Join(destination, name))
 		if err != nil {
 			return Meta{}, err
