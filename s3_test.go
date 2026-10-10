@@ -131,6 +131,11 @@ func (m *mockS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *mockS3) put(w http.ResponseWriter, r *http.Request, key string) {
+	if r.Header.Get("X-Amz-Copy-Source") != "" {
+		m.copy(w, r, key)
+		return
+	}
+
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -183,6 +188,46 @@ func (m *mockS3) put(w http.ResponseWriter, r *http.Request, key string) {
 
 	w.Header().Set("ETag", fmt.Sprintf(`"%x"`, sha256.Sum256(data)))
 	w.WriteHeader(http.StatusOK)
+}
+
+// copy is CopyObject: a PUT naming its source rather than carrying a body.
+func (m *mockS3) copy(w http.ResponseWriter, r *http.Request, key string) {
+	source, err := url.PathUnescape(r.Header.Get("X-Amz-Copy-Source"))
+	if err != nil {
+		http.Error(w, "bad copy", 400)
+		return
+	}
+	source = strings.TrimPrefix(source, "/"+m.bucket+"/")
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	obj, ok := m.objects[source]
+	if !ok {
+		http.Error(w, "NoSuchKey", 404)
+		return
+	}
+	m.objects[key] = mockObject{data: append([]byte(nil), obj.data...), meta: obj.meta, modified: time.Now()}
+	fmt.Fprintf(w, `<CopyObjectResult><ETag>"%x"</ETag></CopyObjectResult>`, sha256.Sum256(obj.data))
+}
+
+// age moves an object's modification time back, as though it had been written
+// that long ago.
+func (m *mockS3) age(key string, by time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	obj, ok := m.objects[key]
+	if !ok {
+		panic("no such key to age: " + key)
+	}
+	obj.modified = obj.modified.Add(-by)
+	m.objects[key] = obj
+}
+
+func (m *mockS3) has(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.objects[key]
+	return ok
 }
 
 func (m *mockS3) getOrHead(w http.ResponseWriter, r *http.Request, key string, body bool) {
@@ -260,7 +305,7 @@ func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
 			page.CommonPrefixes = append(page.CommonPrefixes, struct{ Prefix string }{name})
 			continue
 		}
-		page.Contents = append(page.Contents, s3ListedKey{Key: name, LastModified: m.objects[key].modified})
+		page.Contents = append(page.Contents, s3ListedKey{Key: name, LastModified: m.objects[key].modified, Size: int64(len(m.objects[key].data))})
 	}
 	page.KeyCount = len(keys)
 	w.Header().Set("Content-Type", "application/xml")
@@ -1215,8 +1260,17 @@ func (m *mockS3) multipart(w http.ResponseWriter, r *http.Request, key string) {
 			http.Error(w, "bad part", 400)
 			return
 		}
-		up.Parts[number] = append([]byte(nil), obj.data...)
-		fmt.Fprintf(w, `<CopyPartResult><ETag>"%x"</ETag></CopyPartResult>`, sha256.Sum256(obj.data))
+		data := obj.data
+		if v := r.Header.Get("X-Amz-Copy-Source-Range"); v != "" {
+			var start, end int
+			if _, err := fmt.Sscanf(v, "bytes=%d-%d", &start, &end); err != nil || start > end || end >= len(data) {
+				http.Error(w, "InvalidArgument", 400)
+				return
+			}
+			data = data[start : end+1]
+		}
+		up.Parts[number] = append([]byte(nil), data...)
+		fmt.Fprintf(w, `<CopyPartResult><ETag>"%x"</ETag></CopyPartResult>`, sha256.Sum256(data))
 	case http.MethodPost:
 		var complete struct {
 			Parts []struct {

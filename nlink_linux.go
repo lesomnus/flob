@@ -22,3 +22,6 @@ func nlink(p string) (int, error) {
 
 	return int(stat.Nlink), nil
 }
+
+// nlinkKnown is whether [nlink] reads the count.
+const nlinkKnown = true

@@ -6,6 +6,7 @@ import (
 	"encoding"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -305,6 +306,48 @@ func AsStageCleaner(s Stores) (StageCleaner, bool) {
 	}
 	return nil, false
 }
+
+// Reclaimer is a pool-wide maintenance capability: it gives back the bytes of
+// blobs that no store references any more. The host invokes it on a schedule;
+// flob does not start a background sweeper.
+//
+// [Store.Erase] removes one store's reference. Whether the bytes go with the
+// last one depends on the backend -- memory releases them at once, the OS
+// backend unlinks the last hard link inline except after a crash or a race,
+// and S3 never deletes inline, because no S3 request can delete an object only
+// if nothing references it. Reclaim is how an erasure that must mean the
+// content is gone gets there.
+//
+// grace is the longest an Add may take: from first finding or writing a blob to
+// writing its reference. A blob is reclaimed only once it has gone that long
+// unreferenced, so that one an Add is still committing is never taken from it;
+// a grace shorter than an Add can take is a grace that can lose a committed
+// blob, and zero is refused. Once Reclaim has run twice, at least grace apart,
+// after the last reference to a blob was erased, no copy of its bytes remains
+// in the backend -- backups are the operator's.
+//
+// The count is blobs whose bytes were removed; cleanup may have made progress
+// even when it returns an error.
+type Reclaimer interface {
+	Reclaim(ctx context.Context, grace time.Duration) (int, error)
+}
+
+func AsReclaimer(s Stores) (Reclaimer, bool) {
+	for s != nil {
+		if r, ok := s.(Reclaimer); ok {
+			return r, true
+		}
+		u, ok := s.(interface{ Unwrap() Stores })
+		if !ok {
+			break
+		}
+		s = u.Unwrap()
+	}
+	return nil, false
+}
+
+// errNoGrace is what Reclaim answers a grace of nothing with.
+var errNoGrace = errors.New("reclaim: a grace of nothing reclaims a blob an Add is still committing")
 
 // Versioned checkpoint shared by implementations. A checkpoint describes only
 // committed append bytes; unreferenced attempt data is never part of its hash.

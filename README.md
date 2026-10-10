@@ -322,22 +322,35 @@ reason:
   every ordering preserves the observable invariant (a label never outlives its blob, and a
   live blob is never left in a corrupt state). Serialization is intentionally omitted.
 
-### Why there is no garbage collector (yet)
+### Reclaiming erased bytes
 
-A background GC that reclaims orphaned inodes is the obvious next step, but it is
-**intentionally deferred**. A naive sweeper cannot easily distinguish an orphan from an
-inode that a slow, in-flight `Add` has created but not yet committed (linked into a repo).
-Collecting such an inode would corrupt a legitimate, succeeding upload — exactly the kind of
-user-visible failure the design refuses to introduce. Until the sweeper can prove an inode
-is safe to reclaim (e.g. via staging generations or age/liveness bookkeeping), tolerating
-the leak is preferred over risking a live upload.
+`Erase` removes one store's entry, and on the filesystem the last one takes the
+shared inode with it. What it can leave is an **orphan**: a `share/` inode no
+store links any more, after a crash between an `Erase` and its cleanup or an `Add`
+that stopped after linking it. `OsStores.Reclaim(ctx, grace)` removes those once
+they are older than `grace`. It takes each blob's lock first — every path that
+links a blob holds it while it does — so it never takes an inode an `Add` is
+linking, and it can never lose content a store still has, since each store's
+entry is a hard link of its own.
+
+`Reclaimer` is the capability, found with `AsReclaimer`, and the host runs it on
+a schedule; flob starts no sweeper. S3 implements it too, where it matters more:
+an S3 `Erase` never deletes the shared object, for the reason
+[s3.md](s3.md#consistency--garbage-collection) gives, so without a sweep an
+erased blob stays in the bucket for as long as the bucket does. Memory releases a
+blob's bytes with its last reference and has nothing to reclaim.
+
+`grace` is the longest an `Add` may take. After a reclaim — two, on S3, at least
+`grace` apart — following the last `Erase` of a blob, no copy of its bytes remains
+in the backend; backups are the operator's.
 
 ### Platform note
 
 On non-Linux platforms the hard-link count is not read (see `nlink.go`), so `Erase` always
 believes it is removing the last reference and deletes the shared `share/` inode eagerly.
 Per-store hard links keep the content fully readable, so this is a *dedup degradation*
-(subsequent adds re-copy the content), never data loss.
+(subsequent adds re-copy the content), never data loss. `Reclaim` answers
+`ErrUnimplemented` there rather than take inodes it cannot tell from shared ones.
 
 ## Resumable staged uploads
 
