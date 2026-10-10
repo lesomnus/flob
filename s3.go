@@ -321,6 +321,21 @@ func (s *S3Stores) head(ctx context.Context, key string) (*http.Response, error)
 }
 
 // exists reports whether key is present, mapping 404 to (false, nil).
+// headBlob is a HEAD of the bytes of d, and the key they are under: blob/, or
+// trash/ while a reclaim has put them aside -- which a reference an Add wrote
+// as the reclaim ran still reads. See [S3Stores.Reclaim].
+func (s *S3Stores) headBlob(ctx context.Context, d Digest) (string, *http.Response, error) {
+	key := s.blobKey(d)
+	res, err := s.head(ctx, key)
+	if !errors.Is(err, ErrNotExist) {
+		return key, res, err
+	}
+
+	key = s.trashKey(d)
+	res, err = s.head(ctx, key)
+	return key, res, err
+}
+
 func (s *S3Stores) exists(ctx context.Context, key string) (bool, error) {
 	res, err := s.head(ctx, key)
 	if err != nil {
@@ -758,7 +773,7 @@ func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, 
 
 	// The reference authorizes access; a separate blob HEAD preserves Open's
 	// missing-object check and captures its representation validator and size.
-	blob, err := s.stores.head(ctx, s.stores.blobKey(d))
+	key, blob, err := s.stores.headBlob(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -769,7 +784,7 @@ func (s *S3Store) Open(ctx context.Context, d Digest) (io.ReadSeekCloser, Info, 
 	blobURL := responseURL(blob)
 	reader := newHTTPRangeReader(ctx, size, blobURL, blobURL, blob.Header.Get("ETag"), true,
 		func(ctx context.Context, _ string, offset int64, etag string) (*http.Response, error) {
-			req, err := s.stores.newRequest(ctx, http.MethodGet, s.stores.blobKey(d), nil, nil)
+			req, err := s.stores.newRequest(ctx, http.MethodGet, key, nil, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -802,7 +817,13 @@ func (s *S3Store) PresignOpen(ctx context.Context, d Digest, ttl time.Duration) 
 	labels, size := metaToLabels(hres.Header)
 	hres.Body.Close()
 
-	loc, err := s.stores.presignGet(ctx, s.stores.blobKey(d), ttl)
+	key, blob, err := s.stores.headBlob(ctx, d)
+	if err != nil {
+		return "", Meta{}, err
+	}
+	blob.Body.Close()
+
+	loc, err := s.stores.presignGet(ctx, key, ttl)
 	if err != nil {
 		return "", Meta{}, err
 	}
@@ -850,10 +871,9 @@ func (s *S3Store) Erase(ctx context.Context, d Digest) error {
 	// unlinked. Reclaiming here would therefore violate the "correctness is
 	// preserved; only reclaimable disk space is at risk" invariant.
 	//
-	// Reclamation is instead deferred to an out-of-band, grace-period sweep (see
-	// s3.md), matching the OS backend's deferral of orphan collection: a leak of
-	// reclaimable space is accepted in exchange for never destroying committed
-	// content.
+	// Reclamation is instead the sweep [S3Stores.Reclaim], which puts a blob
+	// nothing references aside before it removes it, so that a reference such
+	// an Add writes meanwhile still reads; see s3.md.
 	return s.stores.deleteKey(ctx, s.stores.refKey(d, s.id))
 }
 
@@ -1727,6 +1747,7 @@ func (s *s3Stage) Abort(ctx context.Context) error {
 type s3ListedKey struct {
 	Key          string
 	LastModified time.Time
+	Size         int64
 }
 
 func (g *S3Stores) stageKeys(ctx context.Context, only ...string) ([]s3ListedKey, error) {
