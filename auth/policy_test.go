@@ -157,6 +157,30 @@ func TestOIDCProtectedHTTPStore(t *testing.T) {
 	request("GET", path, token, "", 200)
 	// The same canonical namespace is authorized after URL decoding.
 	request("GET", "/%5f/sha256:"+hex.EncodeToString(digest[:]), token, "", 200)
+	// The configured HTTP backend sends the same OIDC ID token using the
+	// public constructor, for writes, metadata and streamed range reads.
+	client, err := flob.NewHttpStores(flob.HttpConfig{
+		Targets: []string{server.URL},
+		Auth: map[string]flob.HTTPAuth{server.URL: {
+			Kind: "bearer", Value: func() (string, error) { return token, nil },
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := client.Use("_").Add(t.Context(), flob.Meta{}, strings.NewReader("configured client bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _, err := client.Use("_").Open(t.Context(), m.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	r.Close()
+	if err != nil || string(got) != "configured client bytes" {
+		t.Fatalf("configured client download = %q, %v", got, err)
+	}
 	badJob := p.claims()
 	badJob["workflow_ref"] = "acme/assets/.github/workflows/untrusted.yml@refs/heads/main"
 	request("POST", "/_", sign(t, p.key, "k1", badJob), "untrusted workflow", 403)

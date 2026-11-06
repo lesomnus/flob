@@ -22,6 +22,7 @@ const (
 	refreshInterval = 10 * time.Second
 	clockSkew       = 30 * time.Second
 	metadataLimit   = 1 << 20
+	metadataTimeout = 10 * time.Second
 )
 
 var algorithms = []jose.SignatureAlgorithm{
@@ -38,6 +39,8 @@ type oidcVerifier struct {
 	keys             jose.JSONWebKeySet
 	fetched, tried   time.Time
 	jwksURI          string
+	refreshing       chan struct{}
+	refreshErr       error
 }
 
 func secureURL(raw string) bool {
@@ -55,8 +58,8 @@ func newOIDC(c ProviderConfig, client *http.Client) (*oidcVerifier, error) {
 	if client != nil {
 		hc = *client
 	}
-	if hc.Timeout == 0 || hc.Timeout > 10*time.Second {
-		hc.Timeout = 10 * time.Second
+	if hc.Timeout <= 0 || hc.Timeout > metadataTimeout {
+		hc.Timeout = metadataTimeout
 	}
 	// Metadata may redirect, but credentials or cleartext endpoints are never used.
 	previous := hc.CheckRedirect
@@ -140,41 +143,83 @@ func signingKey(keys jose.JSONWebKeySet, kid string) (jose.JSONWebKey, bool) {
 }
 
 func (o *oidcVerifier) key(ctx context.Context, kid string) (jose.JSONWebKey, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return jose.JSONWebKey{}, err
+		}
+		o.mu.Lock()
+		now := o.now()
+		// Cached identities need not wait behind an unknown key's refresh.
+		if key, ok := signingKey(o.keys, kid); ok && now.Sub(o.fetched) < keyLifetime {
+			o.mu.Unlock()
+			return key, nil
+		}
+		done := o.refreshing
+		if done == nil {
+			if !o.tried.IsZero() && now.Sub(o.tried) < refreshInterval {
+				err := o.refreshErr
+				if err == nil && (o.fetched.IsZero() || now.Sub(o.fetched) >= keyLifetime) {
+					err = errors.New("OIDC metadata refresh is unavailable")
+				}
+				if err == nil {
+					err = flob.ErrUnauthenticated
+				}
+				o.mu.Unlock()
+				return jose.JSONWebKey{}, err
+			}
+			o.tried = now
+			done = make(chan struct{})
+			o.refreshing = done
+			go o.refresh(done, o.jwksURI)
+		}
+		o.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return jose.JSONWebKey{}, ctx.Err()
+		case <-done:
+		}
+	}
+}
+
+func (o *oidcVerifier) refresh(done chan struct{}, jwksURI string) {
+	// A caller disconnecting must not abort shared discovery or poison its
+	// cooldown. The refresh has its own total bound, independent of waiters.
+	ctx, cancel := context.WithTimeout(context.Background(), metadataTimeout)
+	defer cancel()
+	keys, uri, err := o.fetchKeys(ctx, jwksURI)
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	now := o.now()
-	if key, ok := signingKey(o.keys, kid); ok && now.Sub(o.fetched) < keyLifetime {
-		return key, nil
+	completed := o.now()
+	// Start cooldown at completion so a slow failed fetch cannot make its
+	// own waiter immediately launch another refresh in a loop.
+	o.tried = completed
+	if err == nil {
+		o.keys, o.fetched, o.jwksURI = keys, completed, uri
 	}
-	if !o.tried.IsZero() && now.Sub(o.tried) < refreshInterval {
-		if o.fetched.IsZero() || now.Sub(o.fetched) >= keyLifetime {
-			return jose.JSONWebKey{}, errors.New("OIDC metadata refresh is unavailable")
-		}
-		return jose.JSONWebKey{}, flob.ErrUnauthenticated
-	}
-	o.tried = now
-	if o.jwksURI == "" {
+	o.refreshErr = err
+	o.refreshing = nil
+	close(done)
+}
+
+func (o *oidcVerifier) fetchKeys(ctx context.Context, jwksURI string) (jose.JSONWebKeySet, string, error) {
+	if jwksURI == "" {
 		var discovery struct {
 			Issuer  string `json:"issuer"`
 			JwksURI string `json:"jwks_uri"`
 		}
 		if err := o.get(ctx, strings.TrimRight(o.issuer, "/")+"/.well-known/openid-configuration", &discovery); err != nil {
-			return jose.JSONWebKey{}, err
+			return jose.JSONWebKeySet{}, "", err
 		}
 		if discovery.Issuer != o.issuer || !secureURL(discovery.JwksURI) {
-			return jose.JSONWebKey{}, errors.New("invalid OIDC discovery issuer or JWKS URI")
+			return jose.JSONWebKeySet{}, "", errors.New("invalid OIDC discovery issuer or JWKS URI")
 		}
-		o.jwksURI = discovery.JwksURI
+		jwksURI = discovery.JwksURI
 	}
 	var keys jose.JSONWebKeySet
-	if err := o.get(ctx, o.jwksURI, &keys); err != nil {
-		return jose.JSONWebKey{}, err
+	if err := o.get(ctx, jwksURI, &keys); err != nil {
+		return jose.JSONWebKeySet{}, "", err
 	}
-	o.keys, o.fetched = keys, now
-	if key, ok := signingKey(keys, kid); ok {
-		return key, nil
-	}
-	return jose.JSONWebKey{}, flob.ErrUnauthenticated
+	return keys, jwksURI, nil
 }
 
 func (o *oidcVerifier) get(ctx context.Context, target string, value any) error {
