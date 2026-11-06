@@ -37,6 +37,15 @@ jobs:
       - name: Test
         run: go test -short -trimpath -timeout 10m ./...
 
+      - name: Verify standalone CLI module
+        working-directory: cmd
+        env:
+          GOWORK: "off"
+        run: |
+          go vet ./...
+          go test -short -trimpath -timeout 10m ./...
+          go build -o "$RUNNER_TEMP/flob" ./flob
+
       - name: Test CLI against the same library source
         run: |
           export GOWORK="$RUNNER_TEMP/flob.work"
