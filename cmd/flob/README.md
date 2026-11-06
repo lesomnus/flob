@@ -1,5 +1,25 @@
 # flob CLI
 
+## Public read-only serving
+
+The server can expose only selected namespaces and reject all mutations:
+
+```yaml
+stores:
+  os/public:
+    path: /data
+server:
+  use: os/public
+  read_only: true
+  allowed_stores: ["_"]
+```
+
+`read_only` permits GET and HEAD and returns 405 for other methods before
+accessing storage. `allowed_stores` compares decoded namespace IDs and returns
+404 for other namespaces, even if they hold the requested digest. By default
+the server remains writable and an empty allowlist permits every namespace.
+Mount `/data` read-only as well when another process owns publication.
+
 ## Commands
 
 ### Argument Conventions
