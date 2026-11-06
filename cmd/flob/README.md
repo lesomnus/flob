@@ -20,6 +20,40 @@ accessing storage. `allowed_stores` compares decoded namespace IDs and returns
 the server remains writable and an empty allowlist permits every namespace.
 Mount `/data` read-only as well when another process owns publication.
 
+## HTTP read origins and authentication
+
+HTTP stores use an ordered `targets` list. GET and HEAD advance to the next
+target only if the transport fails before any HTTP response. Status codes such
+as 401, 404 and 503 are terminal. Writes do not fail over.
+
+```yaml
+stores:
+  http/remote:
+    targets:
+      - https://primary.example/blobs
+      - https://backup.example/blobs
+    auth:
+      "https://primary.example":
+        bearer_token_env: PRIMARY_BLOB_TOKEN
+      "https://backup.example":
+        bearer_token_env: BACKUP_BLOB_TOKEN
+client:
+  use: http/remote
+```
+
+Authentication keys are origins: scheme, hostname and effective port, without a
+path or query. HTTPS defaults to port 443 and HTTP to 80. Public origins omit
+their auth entry. Referenced environment variables must be nonempty; they are
+resolved when the store is built and their values are not included in `flob conf`.
+Redirects select authentication for their actual origin, so a primary token is
+never inherited by a different origin. A configured token applies to all paths
+at that origin. Store only environment variable names in this configuration.
+
+The previous singular `target` setting is replaced by `targets`, even for a
+single server. Downloads pin the first GET response URL for subsequent range
+requests. An interrupted response body is returned to the caller, not retried
+or joined to bytes from another server.
+
 ## Commands
 
 ### Argument Conventions
@@ -44,7 +78,7 @@ If no config files are found, it will print default config.
 ```yaml
 stores:
   http/local:
-    target: http://localhost:8080
+    targets: [http://localhost:8080]
   os/cwd:
     path: .flob
 server:
