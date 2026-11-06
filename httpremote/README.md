@@ -16,6 +16,8 @@ and verify the final digest. Relative redirects retain the actual origin and
 credentials are stripped when switching origins. Redirect failures do not restart
 the original request at another base. A supplied `http.Client.Timeout` covers
 all attempts and reading the response body. Requests passed to `Do` are cloned.
+`Config.WrapTransport` can add tracing without replacing the default timeout
+configuration. A supplied custom transport keeps its own timeout policy.
 
 ## Authentication
 

@@ -14,13 +14,14 @@ import (
 )
 
 func TestRedirectMustNotRestoreCredentials(t *testing.T) {
-	var auth, cookie string
+	var auth, cookie, proxyAuth string
 	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/alias" {
 			http.Redirect(w, r, "/blob", http.StatusTemporaryRedirect)
 			return
 		}
 		auth, cookie = r.Header.Get("Authorization"), r.Header.Get("Cookie")
+		proxyAuth = r.Header.Get("Proxy-Authorization")
 		io.WriteString(w, "ok")
 	}))
 	defer second.Close()
@@ -32,13 +33,14 @@ func TestRedirectMustNotRestoreCredentials(t *testing.T) {
 	req, _ := http.NewRequest("GET", first+"/alias", nil)
 	req.Header.Set("Authorization", "Bearer primary-secret")
 	req.Header.Set("Cookie", "session=primary-secret")
+	req.Header["proxy-authorization"] = []string{"lowercase-secret"}
 	resp, err := c.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if auth != "" || cookie != "" {
-		t.Fatalf("fallback redirect received original credentials: Authorization=%q Cookie=%q", auth, cookie)
+	if auth != "" || cookie != "" || proxyAuth != "" {
+		t.Fatalf("fallback redirect received original credentials: Authorization=%q Cookie=%q Proxy-Authorization=%q", auth, cookie, proxyAuth)
 	}
 }
 
@@ -253,5 +255,20 @@ func TestInvalidAuthenticationDoesNotExposeTokens(t *testing.T) {
 		if err == nil || strings.Contains(err.Error(), "secret") {
 			t.Fatalf("invalid configuration error = %v", err)
 		}
+	}
+}
+
+func TestTransportDecorationKeepsDefaultTimeouts(t *testing.T) {
+	calls := 0
+	_, err := NewClient(nil, Config{Targets: []string{"https://origin.invalid"}, WrapTransport: func(base http.RoundTripper) http.RoundTripper {
+		calls++
+		transport, ok := base.(*http.Transport)
+		if !ok || transport.ResponseHeaderTimeout <= 0 || transport.TLSHandshakeTimeout <= 0 {
+			t.Fatalf("unbounded default transport: %v", base)
+		}
+		return base
+	}})
+	if err != nil || calls != 1 {
+		t.Fatalf("transport decoration: calls=%d error=%v", calls, err)
 	}
 }

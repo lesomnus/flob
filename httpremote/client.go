@@ -26,6 +26,9 @@ type Client struct {
 type Config struct {
 	Targets      []string
 	BearerTokens map[string]string
+	// WrapTransport decorates the selected transport once, after the default
+	// dial, TLS and response-header timeouts have been configured.
+	WrapTransport func(http.RoundTripper) http.RoundTripper
 }
 
 // NewClient copies client and configures ordered base URLs. Only GET/HEAD
@@ -79,6 +82,12 @@ func NewClient(client *http.Client, config Config) (*Client, error) {
 			t.TLSHandshakeTimeout = 5 * time.Second
 			t.ResponseHeaderTimeout = 15 * time.Second
 			c.client.Transport = t
+		}
+	}
+	if config.WrapTransport != nil {
+		c.client.Transport = config.WrapTransport(c.client.Transport)
+		if c.client.Transport == nil {
+			return nil, fmt.Errorf("transport wrapper returned nil")
 		}
 	}
 	checkRedirect := c.client.CheckRedirect
@@ -189,9 +198,17 @@ func (c *Client) Head(rawURL string) (*http.Response, error) {
 
 func stripCredentials(r *http.Request) {
 	r.Host, r.URL.User = "", nil
-	r.Header.Del("Authorization")
-	r.Header.Del("Proxy-Authorization")
-	r.Header.Del("Cookie")
+	removeHeader(r.Header, "Authorization")
+	removeHeader(r.Header, "Proxy-Authorization")
+	removeHeader(r.Header, "Cookie")
+}
+
+func removeHeader(header http.Header, name string) {
+	for key := range header {
+		if strings.EqualFold(key, name) {
+			delete(header, key)
+		}
+	}
 }
 
 func origin(u *url.URL) string {
@@ -216,6 +233,7 @@ type attemptTransport struct {
 func (t *attemptTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if token, ok := t.tokens[origin(r.URL)]; ok {
 		r = r.Clone(r.Context())
+		removeHeader(r.Header, "Authorization")
 		r.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := t.base.RoundTrip(r)
