@@ -14,6 +14,7 @@ import (
 	"github.com/lesomnus/flob/httpremote"
 	"github.com/lesomnus/otx"
 	"github.com/lesomnus/otx/otxhttp"
+	"github.com/lesomnus/xli/cfg"
 	"github.com/lesomnus/z"
 )
 
@@ -53,19 +54,15 @@ func (c StoresConfig) build(ctx context.Context, k string) (s flob.Stores, err e
 
 	case *StoresConfigHttp:
 		client := *http.DefaultClient
-		tokens := make(map[string]string, len(c_.Auth))
+		authentication := make(map[string]httpremote.Auth, len(c_.Auth))
 		for origin, auth := range c_.Auth {
-			if auth.BearerTokenEnv == "" {
-				return nil, fmt.Errorf("HTTP authentication requires bearer_token_env")
+			if auth.Value.IsZero() {
+				return nil, fmt.Errorf("HTTP authentication requires value")
 			}
-			token, ok := os.LookupEnv(auth.BearerTokenEnv)
-			if !ok || token == "" {
-				return nil, fmt.Errorf("HTTP authentication environment variable %q is missing or empty", auth.BearerTokenEnv)
-			}
-			tokens[origin] = token
+			authentication[origin] = httpremote.Auth{Kind: auth.Kind, Value: auth.Value.Value}
 		}
 		remote, err := httpremote.NewClient(&client, httpremote.Config{
-			Targets: c_.Targets, BearerTokens: tokens,
+			Targets: c_.Targets, Auth: authentication,
 			WrapTransport: func(base http.RoundTripper) http.RoundTripper { return otxhttp.NewTransport(otx.From(ctx), base) },
 		})
 		if err != nil {
@@ -183,9 +180,10 @@ type StoresConfigHttp struct {
 	Auth    map[string]HTTPAuthConfig `yaml:"auth,omitempty"`
 }
 
-// HTTPAuthConfig keeps token values out of the serialized CLI configuration.
+// HTTPAuthConfig separates the authentication method from its credential source.
 type HTTPAuthConfig struct {
-	BearerTokenEnv string `yaml:"bearer_token_env"`
+	Kind  string     `yaml:"kind"`
+	Value cfg.Secret `yaml:"value"`
 }
 
 // StoresConfigS3 configures a store backed by an S3 bucket. Credentials and the

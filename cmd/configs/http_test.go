@@ -2,10 +2,13 @@ package configs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -45,9 +48,11 @@ func TestHTTPConfigFailoverAndOriginAuthentication(t *testing.T) {
   targets: [%q, %q]
   auth:
     %q:
-      bearer_token_env: TEST_PRIMARY_BLOB_TOKEN
+      kind: bearer
+      value: "${env:TEST_PRIMARY_BLOB_TOKEN}"
     %q:
-      bearer_token_env: TEST_BACKUP_BLOB_TOKEN
+      kind: bearer
+      value: "${env:TEST_BACKUP_BLOB_TOKEN}"
 `, primary.URL+"/primary", backup.URL+"/backup", primary.URL, backup.URL)
 	c := StoresConfig{}
 	if err := yaml.Unmarshal([]byte(doc), &c); err != nil {
@@ -114,8 +119,8 @@ func TestHTTPConfigPublicOriginNeedsNoAuthentication(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = s.Use("_").Stat(t.Context(), flob.DigestFromBytes([]byte("missing")))
-	if err == nil {
-		t.Fatal("expected missing blob")
+	if !errors.Is(err, flob.ErrNotExist) {
+		t.Fatalf("expected missing blob, got %v", err)
 	}
 	if auth := <-seen; auth != "" {
 		t.Fatalf("public Authorization = %q", auth)
@@ -123,18 +128,115 @@ func TestHTTPConfigPublicOriginNeedsNoAuthentication(t *testing.T) {
 }
 
 func TestHTTPConfigInvalidAuthentication(t *testing.T) {
-	t.Setenv("TEST_BLOB_TOKEN", "token-secret")
 	t.Setenv("TEST_EMPTY_BLOB_TOKEN", "")
-	for _, config := range []StoresConfigHttp{
-		{},
-		{Targets: []string{"https://origin.invalid"}, Auth: map[string]HTTPAuthConfig{"https://origin.invalid": {}}},
-		{Targets: []string{"https://origin.invalid"}, Auth: map[string]HTTPAuthConfig{"https://origin.invalid": {BearerTokenEnv: "TEST_EMPTY_BLOB_TOKEN"}}},
-		{Targets: []string{"https://origin.invalid"}, Auth: map[string]HTTPAuthConfig{"https://origin.invalid/path": {BearerTokenEnv: "TEST_BLOB_TOKEN"}}},
+	for _, doc := range []string{
+		`http/invalid: {targets: []}`,
+		`http/invalid: {targets: ["https://origin.invalid"], auth: {"https://origin.invalid": {kind: bearer}}}`,
+		`http/invalid: {targets: ["https://origin.invalid"], auth: {"https://origin.invalid": {value: token-secret}}}`,
+		`http/invalid: {targets: ["https://origin.invalid"], auth: {"https://origin.invalid": {kind: unsupported, value: token-secret}}}`,
+		`http/invalid: {targets: ["https://origin.invalid"], auth: {"https://origin.invalid/path": {kind: bearer, value: token-secret}}}`,
+		`http/invalid: {targets: ["https://origin.invalid"], auth: {"https://origin.invalid": {kind: bearer, value: "${env:TEST_EMPTY_BLOB_TOKEN}"}}}`,
 	} {
-		c := StoresConfig{"http/invalid": &config}
-		_, err := c.Use(t.Context(), "http/invalid")
+		c := StoresConfig{}
+		err := yaml.Unmarshal([]byte(doc), &c)
+		if err == nil {
+			_, err = c.Use(t.Context(), "http/invalid")
+		}
 		if err == nil || strings.Contains(err.Error(), "token-secret") {
 			t.Fatalf("config error = %v", err)
 		}
+	}
+}
+
+func TestHTTPConfigLiteralAndEnvironmentCredentials(t *testing.T) {
+	t.Setenv("TEST_BASIC_CREDENTIALS", "robot:password:with-colon")
+	for _, test := range []struct{ kind, value, want string }{
+		{"bearer", "literal-token", "Bearer literal-token"},
+		{"basic", "robot:password:with-colon", "Basic cm9ib3Q6cGFzc3dvcmQ6d2l0aC1jb2xvbg=="},
+		{"basic", "${env:TEST_BASIC_CREDENTIALS}", "Basic cm9ib3Q6cGFzc3dvcmQ6d2l0aC1jb2xvbg=="},
+	} {
+		t.Run(test.kind+test.value, func(t *testing.T) {
+			received := make(chan string, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				received <- r.Header.Get("Authorization")
+				w.WriteHeader(404)
+			}))
+			defer srv.Close()
+			doc := fmt.Sprintf("http/remote:\n  targets: [%q]\n  auth:\n    %q:\n      kind: %s\n      value: %q\n", srv.URL, srv.URL, test.kind, test.value)
+			c := StoresConfig{}
+			if err := yaml.Unmarshal([]byte(doc), &c); err != nil {
+				t.Fatal(err)
+			}
+			s, err := c.Use(t.Context(), "http/remote")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = s.Use("_").Stat(t.Context(), flob.DigestFromBytes([]byte("missing")))
+			if !errors.Is(err, flob.ErrNotExist) {
+				t.Fatalf("stat error = %v", err)
+			}
+			if got := <-received; got != test.want {
+				t.Fatalf("Authorization = %q, want %q", got, test.want)
+			}
+			dumped, err := yaml.Marshal(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(dumped), "literal-token") || strings.Contains(string(dumped), "password:with-colon") {
+				t.Fatal("credential leaked into serialized configuration")
+			}
+			if strings.HasPrefix(test.value, "${") && !strings.Contains(string(dumped), test.value) {
+				t.Fatal("secret reference was not preserved")
+			}
+		})
+	}
+}
+
+func TestHTTPConfigSecretFileRotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte("first-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Get("Authorization")
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+	doc := fmt.Sprintf("http/remote:\n  targets: [%q]\n  auth:\n    %q:\n      kind: bearer\n      value: %q\n", srv.URL, srv.URL, "${file:"+path+"}")
+	c := StoresConfig{}
+	if err := yaml.Unmarshal([]byte(doc), &c); err != nil {
+		t.Fatal(err)
+	}
+	s, err := c.Use(t.Context(), "http/remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(want string) {
+		t.Helper()
+		_, err := s.Use("_").Stat(t.Context(), flob.DigestFromBytes([]byte("missing")))
+		if !errors.Is(err, flob.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if got := <-received; got != want {
+			t.Fatalf("Authorization = %q, want %q", got, want)
+		}
+	}
+	check("Bearer first-token")
+	replacement := filepath.Join(dir, "replacement")
+	if err := os.WriteFile(replacement, []byte("second-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	check("Bearer second-token")
+	dumped, err := yaml.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(dumped), "first-token") || strings.Contains(string(dumped), "second-token") {
+		t.Fatal("file credential leaked into serialized configuration")
 	}
 }

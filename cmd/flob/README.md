@@ -34,20 +34,35 @@ stores:
       - https://backup.example/blobs
     auth:
       "https://primary.example":
-        bearer_token_env: PRIMARY_BLOB_TOKEN
+        kind: bearer
+        value: "${env:PRIMARY_BLOB_TOKEN}"
       "https://backup.example":
-        bearer_token_env: BACKUP_BLOB_TOKEN
+        kind: basic
+        value: "${env:BACKUP_BLOB_CREDENTIALS}"
 client:
   use: http/remote
 ```
 
 Authentication keys are origins: scheme, hostname and effective port, without a
 path or query. HTTPS defaults to port 443 and HTTP to 80. Public origins omit
-their auth entry. Referenced environment variables must be nonempty; they are
-resolved when the store is built and their values are not included in `flob conf`.
-Redirects select authentication for their actual origin, so a primary token is
-never inherited by a different origin. A configured token applies to all paths
-at that origin. Store only environment variable names in this configuration.
+their auth entry. Each entry has `kind` and `value`:
+
+- `kind: bearer`: `value` is the token, without the `Bearer ` prefix.
+- `kind: basic`: `value` is the unencoded `username:password` pair. Passwords may
+  contain colons. In the example, BACKUP_BLOB_CREDENTIALS contains the whole pair.
+
+`value` uses `xli/cfg.Secret`: a literal, `${env:NAME}`, or `${file:/path}`. A
+reference must occupy the whole value. For example, a token file can be given
+as `value: "${file:/run/secrets/blob-token}"`. Environment references resolve
+when the configuration is read. Missing or empty referenced variables fail
+configuration. File credentials are rechecked on each request, including after
+rotation; unavailable or invalid credentials fail the request without failover.
+Unknown kinds and missing values are configuration errors. `flob conf` preserves
+references and redacts literal credentials.
+
+Redirects select authentication for their actual origin, so a primary credential
+is never inherited by a different origin. Configured auth applies to all paths
+at its origin.
 
 The previous singular `target` setting is replaced by `targets`, even for a
 single server. Downloads pin the first GET response URL for subsequent range
