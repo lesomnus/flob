@@ -49,7 +49,7 @@ func TestNamespaceIsolation(t *testing.T) {
 			mux.Handle("/", &HttpHandler{Stores: NewOsStores(t.TempDir())})
 			srv := httptest.NewServer(mux)
 			t.Cleanup(srv.Close)
-			return HttpStores{Target: srv.URL, Client: srv.Client()}
+			return mustHttpStores(t, srv.Client(), srv.URL)
 		},
 	}
 	for name, factory := range factories {

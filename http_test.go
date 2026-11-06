@@ -18,11 +18,20 @@ import (
 	"github.com/lesomnus/flob/internal/x"
 )
 
-func newHttpStores(t *testing.T, backend Stores) (HttpStores, *httptest.Server) {
+func mustHttpStores(t *testing.T, client *http.Client, target string) *HttpStores {
+	t.Helper()
+	stores, err := NewHttpStores(HttpConfig{Client: client, Targets: []string{target}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stores
+}
+
+func newHttpStores(t *testing.T, backend Stores) (*HttpStores, *httptest.Server) {
 	t.Helper()
 	s := httptest.NewServer(&HttpHandler{Stores: backend})
 	t.Cleanup(s.Close)
-	return HttpStores{Client: s.Client(), Target: s.URL}, s
+	return mustHttpStores(t, s.Client(), s.URL), s
 }
 
 func TestHttpStore(t *testing.T) {
@@ -34,7 +43,7 @@ func TestHttpStore(t *testing.T) {
 			s := httptest.NewServer(h)
 			t.Cleanup(s.Close)
 
-			return HttpStores{Client: s.Client(), Target: s.URL}
+			return mustHttpStores(t, s.Client(), s.URL)
 		})
 	})
 	t.Run("contract over os backend", func(t *testing.T) {
@@ -45,7 +54,7 @@ func TestHttpStore(t *testing.T) {
 			s := httptest.NewServer(h)
 			t.Cleanup(s.Close)
 
-			return HttpStores{Client: s.Client(), Target: s.URL}
+			return mustHttpStores(t, s.Client(), s.URL)
 		})
 	})
 	t.Run("target with prefix", func(t *testing.T) {
@@ -58,7 +67,7 @@ func TestHttpStore(t *testing.T) {
 			s := httptest.NewServer(mux)
 			t.Cleanup(s.Close)
 
-			return HttpStores{Client: s.Client(), Target: s.URL + "/prefix"}
+			return mustHttpStores(t, s.Client(), s.URL+"/prefix")
 		})
 	})
 	t.Run("digest mismatch maps to ErrDigestMismatch and status 422", func(t *testing.T) {
@@ -167,7 +176,7 @@ func TestHttpStoreLazyRanges(t *testing.T) {
 		HttpHandler{Stores: origin}.ServeHTTP(w, r)
 	}))
 	defer server.Close()
-	store := HttpStores{Client: server.Client(), Target: server.URL}.Use("t")
+	store := mustHttpStores(t, server.Client(), server.URL).Use("t")
 	reader, info, err := store.Open(t.Context(), m.Digest)
 	if err != nil {
 		t.Fatal(err)
@@ -269,7 +278,7 @@ func TestHttpStoreRangeValidation(t *testing.T) {
 				w.Write([]byte("abcdef"))
 			}))
 			defer server.Close()
-			store := HttpStores{Client: server.Client(), Target: server.URL}.Use("t")
+			store := mustHttpStores(t, server.Client(), server.URL).Use("t")
 			reader, _, err := store.Open(t.Context(), DigestFromBytes([]byte("abcdef")))
 			if err != nil {
 				t.Fatal(err)
@@ -307,7 +316,7 @@ func TestHttpStoreBoundedRanges(t *testing.T) {
 		io.WriteString(w, content[start:end+1])
 	}))
 	defer server.Close()
-	reader, _, err := (HttpStores{Client: server.Client(), Target: server.URL}).Use("t").Open(t.Context(), DigestFromBytes([]byte(content)))
+	reader, _, err := mustHttpStores(t, server.Client(), server.URL).Use("t").Open(t.Context(), DigestFromBytes([]byte(content)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +388,7 @@ func TestHttpStoreRangeFallbackAndValidators(t *testing.T) {
 				io.WriteString(w, content[start:])
 			}))
 			defer server.Close()
-			reader, _, err := (HttpStores{Client: server.Client(), Target: server.URL}).Use("t").Open(t.Context(), DigestFromBytes([]byte(content)))
+			reader, _, err := mustHttpStores(t, server.Client(), server.URL).Use("t").Open(t.Context(), DigestFromBytes([]byte(content)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -449,7 +458,7 @@ func TestHttpStoreLargeLazyReadAndCancellation(t *testing.T) {
 			defer server.Close()
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			reader, info, err := (HttpStores{Client: server.Client(), Target: server.URL}).Use("t").Open(ctx, DigestFromBytes([]byte("data")))
+			reader, info, err := mustHttpStores(t, server.Client(), server.URL).Use("t").Open(ctx, DigestFromBytes([]byte("data")))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -555,7 +564,7 @@ func TestHttpStoreRedirectResourceScope(t *testing.T) {
 				http.ServeContent(w, r, "", time.Time{}, strings.NewReader("abcdef"))
 			}))
 			defer server.Close()
-			reader, _, err := (HttpStores{Client: server.Client(), Target: server.URL}).Use("t").Open(t.Context(), DigestFromBytes([]byte("abcdef")))
+			reader, _, err := mustHttpStores(t, server.Client(), server.URL).Use("t").Open(t.Context(), DigestFromBytes([]byte("abcdef")))
 			if err != nil {
 				t.Fatal(err)
 			}

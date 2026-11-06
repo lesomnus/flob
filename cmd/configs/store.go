@@ -13,6 +13,7 @@ import (
 	"github.com/lesomnus/flob"
 	"github.com/lesomnus/otx"
 	"github.com/lesomnus/otx/otxhttp"
+	"github.com/lesomnus/xli/cfg"
 	"github.com/lesomnus/z"
 )
 
@@ -52,12 +53,17 @@ func (c StoresConfig) build(ctx context.Context, k string) (s flob.Stores, err e
 
 	case *StoresConfigHttp:
 		client := *http.DefaultClient
-		client.Transport = otxhttp.NewTransport(otx.From(ctx), client.Transport)
-
-		return flob.HttpStores{
-			Client: &client,
-			Target: c_.Target,
-		}, nil
+		authentication := make(map[string]flob.HTTPAuth, len(c_.Auth))
+		for origin, auth := range c_.Auth {
+			if auth.Value.IsZero() {
+				return nil, fmt.Errorf("HTTP authentication requires value")
+			}
+			authentication[origin] = flob.HTTPAuth{Kind: auth.Kind, Value: auth.Value.Value}
+		}
+		return flob.NewHttpStores(flob.HttpConfig{
+			Client: &client, Targets: c_.Targets, Auth: authentication,
+			WrapTransport: func(base http.RoundTripper) http.RoundTripper { return otxhttp.NewTransport(otx.From(ctx), base) },
+		})
 
 	case *StoresConfigCache:
 		primary, err := c.build(ctx, c_.Primary)
@@ -161,7 +167,14 @@ type StoresConfigOs struct {
 }
 
 type StoresConfigHttp struct {
-	Target string
+	Targets []string                  `yaml:"targets"`
+	Auth    map[string]HTTPAuthConfig `yaml:"auth,omitempty"`
+}
+
+// HTTPAuthConfig separates the authentication method from its credential source.
+type HTTPAuthConfig struct {
+	Kind  string     `yaml:"kind"`
+	Value cfg.Secret `yaml:"value"`
 }
 
 // StoresConfigS3 configures a store backed by an S3 bucket. Credentials and the

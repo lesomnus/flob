@@ -6,7 +6,11 @@ stores:
   # os/cwd:
   #   path: .flob
   # http/local:
-  #   target: http://localhost:8080
+  #   targets: [http://localhost:8080]
+  #   # auth:
+  #   #   "http://localhost:8080":
+  #   #     kind: bearer
+  #   #     value: "${env:LOCAL_BLOB_TOKEN}"
   # s3/main:
   #   # endpoint: https://s3.us-east-1.amazonaws.com  # omit to derive from region
   #   region: us-east-1

@@ -46,7 +46,7 @@ semantics (cross-store dedup, per-store visibility):
 
 - **`OsStores`** — filesystem CAS (described below).
 - **`MemStores`** — in-memory, for tests and caches.
-- **`HttpStores`** / `HttpHandler` — client/server over HTTP (see [`http.md`](./http.md)).
+- **`HttpStores`** / `HttpHandler` — client/server over HTTP. `NewHttpStores(HttpConfig{Targets: ...})` configures read failover and per-origin authentication (see [`http.md`](./http.md)).
 - **`S3Stores`** — any S3-compatible bucket (AWS S3, MinIO) over plain HTTP with no
   AWS SDK dependency; blobs are deduplicated by digest key and stores are isolated
   by per-store reference markers (see [`s3.md`](./s3.md)).

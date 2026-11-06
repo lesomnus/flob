@@ -73,7 +73,7 @@ func configHandler() xli.Handler {
 		}
 		if _, ok := stores["http/local"]; !ok {
 			stores["http/local"] = &configs.StoresConfigHttp{
-				Target: "http://localhost:8080",
+				Targets: []string{"http://localhost:8080"},
 			}
 		}
 
