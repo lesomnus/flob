@@ -3,6 +3,7 @@ module github.com/lesomnus/flob
 go 1.26.1
 
 require (
+	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/gofrs/flock v0.13.0
 	github.com/opencontainers/go-digest v1.0.0
 )

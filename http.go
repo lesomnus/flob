@@ -34,6 +34,9 @@ type HttpHandler struct {
 	// AllowedStores limits decoded namespace IDs. Empty preserves unrestricted
 	// namespace selection for existing callers.
 	AllowedStores []string
+	// Authorizer, when set, gates every supported operation before storage access.
+	// Nil preserves unauthenticated serving for existing callers.
+	Authorizer HTTPAuthorizer
 
 	// Redirect, when true, serves GET by redirecting to a backend-provided
 	// presigned URL when [AsPresigner] finds that capability. If unavailable or
@@ -64,8 +67,6 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	store := h.Stores.Use(id)
-
 	d := Digest(digest_raw)
 	if d != "" {
 		var err error
@@ -78,6 +79,10 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !h.authorize(w, r, id) {
+		return
+	}
+	store := h.Stores.Use(id)
 
 	ctx := r.Context()
 	switch r.Method {
