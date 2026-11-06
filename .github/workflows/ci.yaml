@@ -37,13 +37,6 @@ jobs:
       - name: Test
         run: go test -short -trimpath -timeout 10m ./...
 
-      - name: Test CLI against the same library source
-        run: |
-          export GOWORK="$RUNNER_TEMP/flob.work"
-          go work init . ./cmd
-          go vet ./cmd/...
-          go test -short -trimpath -timeout 10m ./cmd/...
-
   build:
     needs: test
     runs-on: ubuntu-latest

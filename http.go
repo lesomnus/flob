@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,11 +28,6 @@ import (
 // of GET and HEAD requests without the prefix.
 type HttpHandler struct {
 	Stores Stores
-	// ReadOnly permits only GET and HEAD, before any store operation.
-	ReadOnly bool
-	// AllowedStores limits decoded namespace IDs. Empty preserves unrestricted
-	// namespace selection for existing callers.
-	AllowedStores []string
 
 	// Redirect, when true, serves GET by redirecting to a backend-provided
 	// presigned URL when [AsPresigner] finds that capability. If unavailable or
@@ -49,18 +43,9 @@ type HttpHandler struct {
 const DefaultRedirectTTL = 15 * time.Minute
 
 func (h HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.ReadOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	id, digest_raw, ok := h.parsePath(r.URL.EscapedPath())
 	if !ok {
 		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if len(h.AllowedStores) > 0 && !slices.Contains(h.AllowedStores, id) {
-		http.NotFound(w, r)
 		return
 	}
 

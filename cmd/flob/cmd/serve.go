@@ -32,8 +32,7 @@ func NewCmdServe() *xli.Command {
 
 			l := log.From(ctx)
 
-			h := flob.HttpHandler{Stores: s, Redirect: c.Server.Redirect,
-				ReadOnly: c.Server.ReadOnly, AllowedStores: c.Server.AllowedStores}
+			h := flob.HttpHandler{Stores: s, Redirect: c.Server.Redirect}
 			mux := http.NewServeMux()
 			x := otx.From(ctx)
 			mux.Handle("/", otxhttp.NewHandler(x, otxhttp.BoundaryLogger(x)(h), "/"))

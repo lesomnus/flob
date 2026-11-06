@@ -13,9 +13,7 @@ type ServerConfig struct {
 	// Redirect serves blob downloads by redirecting to a backend presigned URL
 	// when the store supports it (e.g. S3), instead of streaming through the
 	// server. Stores without presign support stream as usual.
-	Redirect      bool     `yaml:",omitempty"`
-	ReadOnly      bool     `yaml:"read_only,omitempty"`
-	AllowedStores []string `yaml:"allowed_stores,omitempty"`
+	Redirect bool `yaml:",omitempty"`
 }
 
 func (c *ServerConfig) Evaluate() error {
