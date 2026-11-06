@@ -77,6 +77,10 @@ or invalid credentials return 401, insufficient grants 403, and unavailable
 provider metadata 503. Rejections happen before opening storage or consuming an
 upload body, and responses do not expose credentials or verifier diagnostics.
 
+The scratch image does not include a CA bundle. Mount trusted roots at
+`/etc/ssl/certs/ca-certificates.crt`, or configure `SSL_CERT_FILE`/`SSL_CERT_DIR`,
+so HTTPS discovery and JWKS requests can verify the provider certificate.
+
 An upload step obtains a fresh, short-lived ID token and sends it directly:
 
 ```yaml
