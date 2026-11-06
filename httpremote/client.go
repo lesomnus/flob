@@ -17,15 +17,15 @@ import (
 type Client struct {
 	client  http.Client
 	targets []*url.URL
-	tokens  map[string]string
+	auth    map[string]Auth
 }
 
-// Config separates ordered download bases from authentication. BearerTokens
-// maps exact origins (scheme, hostname and effective port; no path) to tokens.
+// Config separates ordered download bases from authentication. Auth maps exact
+// origins (scheme, hostname and effective port; no path) to credentials.
 // An origin without an entry receives no configured Authorization header.
 type Config struct {
-	Targets      []string
-	BearerTokens map[string]string
+	Targets []string
+	Auth    map[string]Auth
 	// WrapTransport decorates the selected transport once, after the default
 	// dial, TLS and response-header timeouts have been configured.
 	WrapTransport func(http.RoundTripper) http.RoundTripper
@@ -39,7 +39,7 @@ func NewClient(client *http.Client, config Config) (*Client, error) {
 	if len(config.Targets) == 0 {
 		return nil, fmt.Errorf("at least one HTTP target is required")
 	}
-	c := &Client{client: *http.DefaultClient, tokens: map[string]string{}}
+	c := &Client{client: *http.DefaultClient, auth: map[string]Auth{}}
 	seen := map[string]bool{}
 	for i, raw := range config.Targets {
 		u, err := url.Parse(raw)
@@ -56,20 +56,23 @@ func NewClient(client *http.Client, config Config) (*Client, error) {
 		seen[key] = true
 		c.targets = append(c.targets, u)
 	}
-	for raw, token := range config.BearerTokens {
+	for raw, auth := range config.Auth {
 		u, err := url.Parse(raw)
 		if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") ||
 			u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-			return nil, fmt.Errorf("bearer authentication requires an HTTP origin without a path, query or userinfo")
+			return nil, fmt.Errorf("authentication requires an HTTP origin without a path, query or userinfo")
 		}
 		key := origin(u)
-		if _, exists := c.tokens[key]; exists {
-			return nil, fmt.Errorf("duplicate bearer authentication origin %s", key)
+		if _, exists := c.auth[key]; exists {
+			return nil, fmt.Errorf("duplicate authentication origin %s", key)
 		}
-		if token == "" || strings.IndexFunc(token, func(r rune) bool { return r <= ' ' || r >= 127 }) >= 0 {
-			return nil, fmt.Errorf("invalid bearer token for origin %s", key)
+		if auth.Kind != "bearer" && auth.Kind != "basic" {
+			return nil, fmt.Errorf("unsupported authentication kind %q for origin %s", auth.Kind, key)
 		}
-		c.tokens[key] = token
+		if auth.Value == nil {
+			return nil, fmt.Errorf("authentication value is required for origin %s", key)
+		}
+		c.auth[key] = auth
 	}
 	if client != nil {
 		c.client = *client
@@ -165,7 +168,7 @@ func (c *Client) do(r *http.Request) (*http.Response, error) {
 			}
 		}
 		// A response followed by a redirect failure must not restart the download.
-		attempt := &attemptTransport{base: c.client.Transport, tokens: c.tokens}
+		attempt := &attemptTransport{base: c.client.Transport, auth: c.auth}
 		h := c.client
 		h.Timeout = 0 // Do owns the deadline across all attempts and the body.
 		h.Transport = attempt
@@ -225,16 +228,20 @@ func origin(u *url.URL) string {
 
 type attemptTransport struct {
 	base      http.RoundTripper
-	tokens    map[string]string
+	auth      map[string]Auth
 	responded bool
 	failed    bool
 }
 
 func (t *attemptTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if token, ok := t.tokens[origin(r.URL)]; ok {
+	if auth, ok := t.auth[origin(r.URL)]; ok {
+		header, err := auth.header()
+		if err != nil {
+			return nil, fmt.Errorf("authentication for origin %s: %w", origin(r.URL), err)
+		}
 		r = r.Clone(r.Context())
 		removeHeader(r.Header, "Authorization")
-		r.Header.Set("Authorization", "Bearer "+token)
+		r.Header.Set("Authorization", header)
 	}
 	resp, err := t.base.RoundTrip(r)
 	t.responded = t.responded || resp != nil

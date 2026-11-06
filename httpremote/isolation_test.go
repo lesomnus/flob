@@ -91,12 +91,12 @@ func TestOriginAuthenticationAcrossFailoverAndRedirect(t *testing.T) {
 			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody, Request: r}, nil
 		}
 	})}
-	tokens := map[string]string{primary: "primary-token", fallback: "fallback-token"}
-	c, err := NewClient(base, Config{Targets: []string{primary, fallback}, BearerTokens: tokens})
+	auth := map[string]Auth{primary: literalAuth("bearer", "primary-token"), fallback: literalAuth("basic", "backup-user:backup-pass")}
+	c, err := NewClient(base, Config{Targets: []string{primary, fallback}, Auth: auth})
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokens[fallback] = "changed-after-construction"
+	auth[fallback] = literalAuth("bearer", "changed-after-construction")
 	r, _ := http.NewRequest("GET", primary+"/blob", nil)
 	r.Header.Set("Authorization", "Bearer caller-token")
 	r.Header.Set("Cookie", "caller=secret")
@@ -106,7 +106,7 @@ func TestOriginAuthenticationAcrossFailoverAndRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	want := []string{primary + "/blob Bearer primary-token", fallback + "/blob Bearer fallback-token", public + "/blob "}
+	want := []string{primary + "/blob Bearer primary-token", fallback + "/blob Basic YmFja3VwLXVzZXI6YmFja3VwLXBhc3M=", public + "/blob "}
 	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("requests = %q, want %q", calls, want)
 	}
@@ -242,18 +242,43 @@ func TestTimeoutBoundsAllAttemptsAndBody(t *testing.T) {
 	}
 }
 
-func TestInvalidAuthenticationDoesNotExposeTokens(t *testing.T) {
-	for _, auth := range []map[string]string{
-		{"https://origin.invalid/path": "secret"},
-		{"https://origin.invalid?query=secret": "secret"},
-		{"https://user:secret@origin.invalid": "secret"},
-		{"https://origin.invalid": "secret\ninvalid"},
-		{"https://origin.invalid": ""},
-		{"https://origin.invalid": "one", "https://ORIGIN.invalid:443/": "two"},
+func literalAuth(kind, value string) Auth {
+	return Auth{Kind: kind, Value: func() (string, error) { return value, nil }}
+}
+
+func TestInvalidAuthenticationConfiguration(t *testing.T) {
+	for _, auth := range []map[string]Auth{
+		{"https://origin.invalid/path": literalAuth("bearer", "secret")},
+		{"https://origin.invalid?query=secret": literalAuth("bearer", "secret")},
+		{"https://user:secret@origin.invalid": literalAuth("bearer", "secret")},
+		{"https://origin.invalid": {Kind: "unsupported", Value: func() (string, error) { return "secret", nil }}},
+		{"https://origin.invalid": {Kind: "bearer"}},
+		{"https://origin.invalid": literalAuth("bearer", "one"), "https://ORIGIN.invalid:443/": literalAuth("bearer", "two")},
 	} {
-		_, err := NewClient(nil, Config{Targets: []string{"https://origin.invalid"}, BearerTokens: auth})
+		_, err := NewClient(nil, Config{Targets: []string{"https://origin.invalid"}, Auth: auth})
 		if err == nil || strings.Contains(err.Error(), "secret") {
 			t.Fatalf("invalid configuration error = %v", err)
+		}
+	}
+}
+
+func TestAuthenticationFailureIsTerminalAndRedacted(t *testing.T) {
+	for _, auth := range []Auth{
+		literalAuth("bearer", ""), literalAuth("bearer", "secret\ninvalid"),
+		literalAuth("basic", "secret-without-colon"), literalAuth("basic", "user:secret\ninvalid"),
+		{Kind: "bearer", Value: func() (string, error) { return "", errors.New("credential source unavailable") }},
+	} {
+		base := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("authentication failure reached transport or fallback")
+			return nil, nil
+		})}
+		c, err := NewClient(base, Config{Targets: []string{"https://origin.invalid", "https://fallback.invalid"}, Auth: map[string]Auth{"https://origin.invalid": auth}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Get("https://origin.invalid/blob")
+		if err == nil || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("authentication error = %v", err)
 		}
 	}
 }

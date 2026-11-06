@@ -21,30 +21,40 @@ configuration. A supplied custom transport keeps its own timeout policy.
 
 ## Authentication
 
-`Config.BearerTokens` maps origins to tokens. An origin is the scheme, hostname
-and effective port, without a path or query. Hostnames are case insensitive;
-omitted ports are 443 for HTTPS and 80 for HTTP. Tokens are copied at construction
-and applied separately to each actual request, including redirects. A configured
-token overrides a request's Authorization header for that origin. An unconfigured
-origin receives no configured token.
+`Config.Auth` maps origins to `Auth{Kind, Value}` providers. An origin is the
+scheme, hostname and effective port, without a path or query. Hostnames are case
+insensitive; omitted ports are 443 for HTTPS and 80 for HTTP. Supported kinds are
+`bearer` (a token) and `basic` (an unencoded `username:password` pair).
+
+`Value` is a function called for every actual request, including redirects. It
+must be safe for concurrent use. This allows a configuration layer to supply a
+literal, environment reference or rotating secret file. A provider error or an
+invalid credential is terminal and never triggers failover. Configured auth
+overrides the request's Authorization header for that origin; an unconfigured
+origin receives no configured credential.
 
 ```go
 client, err := httpremote.NewClient(baseClient, httpremote.Config{
     Targets: []string{"https://primary.example/blobs", "https://backup.example/blobs"},
-    BearerTokens: map[string]string{
-        "https://primary.example": os.Getenv("PRIMARY_BLOB_TOKEN"),
-        "https://backup.example": os.Getenv("BACKUP_BLOB_TOKEN"),
+    Auth: map[string]httpremote.Auth{
+        "https://primary.example": {
+            Kind: "bearer",
+            Value: func() (string, error) { return os.Getenv("PRIMARY_BLOB_TOKEN"), nil },
+        },
     },
 })
 ```
 
 On failover or a cross-origin redirect, explicit Authorization, Proxy-Authorization,
 Cookie and custom Host values are removed. Returning to an earlier origin does
-not restore those explicit headers. An explicitly configured token for the new
+not restore those explicit headers. An explicitly configured credential for the new
 origin may then be applied. CookieJar cookies continue to follow normal cookie
 domain, path and security rules; the jar is consulted and updated for the actual
 request URL. Cookies are not isolated by port. The original CheckRedirect hook
 is preserved and runs after header stripping; it may deliberately set new headers.
 
-The CLI reads origin tokens through `bearer_token_env` references. Missing or
-empty referenced variables fail configuration instead of silently omitting auth.
+The CLI uses `kind` and `value`, with `value` decoded by `xli/cfg.Secret`. It
+accepts literals, `${env:NAME}` and `${file:/path}`. A reference fills the whole
+value. Literal credentials are redacted in `flob conf`; references are preserved.
+Secret files are rechecked per request so rotated files take effect without
+rebuilding the client. Environment references resolve when configuration is read.
