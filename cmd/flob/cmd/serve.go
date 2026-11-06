@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/lesomnus/flob"
 	"github.com/lesomnus/flob/cmd/configs"
 	"github.com/lesomnus/otx"
 	"github.com/lesomnus/otx/log"
@@ -32,8 +31,10 @@ func NewCmdServe() *xli.Command {
 
 			l := log.From(ctx)
 
-			h := flob.HttpHandler{Stores: s, Redirect: c.Server.Redirect,
-				ReadOnly: c.Server.ReadOnly, AllowedStores: c.Server.AllowedStores}
+			h, err := c.Server.Handler(s)
+			if err != nil {
+				return err
+			}
 			mux := http.NewServeMux()
 			x := otx.From(ctx)
 			mux.Handle("/", otxhttp.NewHandler(x, otxhttp.BoundaryLogger(x)(h), "/"))

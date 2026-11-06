@@ -20,6 +20,85 @@ accessing storage. `allowed_stores` compares decoded namespace IDs and returns
 the server remains writable and an empty allowlist permits every namespace.
 Mount `/data` read-only as well when another process owns publication.
 
+## OIDC authentication
+
+An internal publisher can require GitHub Actions job identities instead of a
+stored credential. Omit `server.auth` to keep unauthenticated serving. When it
+is present, every supported operation requires a Bearer ID token and a matching
+grant. Null/empty policies, unknown auth fields, and invalid grants are errors.
+
+```yaml
+stores:
+  os/published:
+    path: /data
+server:
+  use: os/published
+  allowed_stores: ["_"]
+  auth:
+    providers:
+      github:
+        kind: oidc
+        issuer: https://token.actions.githubusercontent.com
+        audience: blob.example.com
+    permissions:
+      publish:
+        stores: ["_"]
+        actions: [read, add]
+    matches:
+      release:
+        for: github
+        when:
+          repository_id: "123456789"
+          workflow_ref: acme/assets/.github/workflows/publish.yml@refs/heads/main
+          ref: refs/heads/main
+        grant: [publish]
+```
+
+`when` compares every named claim as an exact string (AND); missing, non-string,
+or different values do not match. Separate matches can grant additional named
+permissions. Bind GitHub jobs to an approved repository ID and workflow/ref:
+any repository can request an ID token for a chosen audience. For reusable
+workflows, `job_workflow_ref` can additionally constrain the called workflow.
+These claims authenticate jobs, not individual runner machines.
+
+Permissions select decoded namespace IDs exactly; `"*"` selects every namespace.
+Actions are `read` (GET/HEAD), `add` (POST), `label` (PATCH), and `erase` (DELETE).
+The example permits upload and read of published `_` blobs, with no label changes
+or deletion. Publishing into `_` makes data visible to a separate public reader
+of the same store root. `read_only` and `allowed_stores` remain additional limits
+and cannot be overridden by a grant.
+
+The verifier requires HTTPS discovery/JWKS, checks the discovery issuer and the
+token signature, issuer, audience, subject, expiry and issued-at (plus not-before
+when supplied). Standard times allow 30 seconds of clock skew. Signing keys are
+cached for at most five minutes; unknown IDs can trigger a refresh at most once
+per ten seconds. Failed refreshes deny access after the cache expires. Missing
+or invalid credentials return 401, insufficient grants 403, and unavailable
+provider metadata 503. Rejections happen before opening storage or consuming an
+upload body, and responses do not expose credentials or verifier diagnostics.
+
+An upload step obtains a fresh, short-lived ID token and sends it directly:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+steps:
+  # Run after producing asset.bin; use an HTTPS endpoint reachable by this job.
+  - shell: bash
+    run: |
+      token=$(curl --fail --silent --show-error \
+        -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+        "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=blob.example.com" | jq -er .value)
+      echo "::add-mask::$token"
+      curl --fail --silent --show-error \
+        -H "Authorization: Bearer $token" \
+        --data-binary @asset.bin https://blob.example.com/_
+```
+
+Refresh the ID token before later requests once it expires. This endpoint accepts
+OIDC Bearer tokens directly; it does not issue registry-style login tokens.
+
 ## Commands
 
 ### Argument Conventions

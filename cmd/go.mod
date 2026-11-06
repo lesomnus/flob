@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/goccy/go-yaml v1.19.2
-	github.com/lesomnus/flob v0.0.0-20261106022353-f3c6f1a4baf6
+	github.com/lesomnus/flob v0.0.0-20261106034823-11ad4848eaec
 	github.com/lesomnus/mkot v0.0.0-20260911021409-f5f7b88768d9
 	github.com/lesomnus/mkot/otlp v0.0.0-20260911021409-f5f7b88768d9
 	github.com/lesomnus/mkot/pretty v0.0.0-20260911021409-f5f7b88768d9
@@ -24,6 +24,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.9 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gofrs/flock v0.13.1 // indirect
