@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/goccy/go-yaml v1.19.2
-	github.com/lesomnus/flob v0.0.0-20261106022353-f3c6f1a4baf6
+	github.com/lesomnus/flob v0.0.0-20261106041903-ccf402f397d5
 	github.com/lesomnus/mkot v0.0.0-20260911021409-f5f7b88768d9
 	github.com/lesomnus/mkot/otlp v0.0.0-20260911021409-f5f7b88768d9
 	github.com/lesomnus/mkot/pretty v0.0.0-20260911021409-f5f7b88768d9
@@ -12,6 +12,7 @@ require (
 	github.com/lesomnus/otx/otxhttp v0.0.0-20260907061046-e1089d8da446
 	github.com/lesomnus/xddr v0.0.0-20260911021415-f8268150c79c
 	github.com/lesomnus/xli v0.0.0-20261007103221-181d76ac7923
+	github.com/lesomnus/xli/cfg v0.1.4-0.20261007103221-181d76ac7923
 	github.com/lesomnus/z v0.0.0-20260907061127-c3858eb05878
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/log v0.20.0

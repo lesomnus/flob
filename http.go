@@ -284,25 +284,34 @@ func parseLastModified(h http.Header) time.Time {
 }
 
 // HttpStores is an HTTP client for [HttpHandler] server.
+// Construct it with NewHttpStores to configure read origins and authentication.
 type HttpStores struct {
-	Client *http.Client
-	Target string // base URL of the server, e.g. "http://localhost:8080"
+	client *httpOriginClient
+	base   string
+}
+
+// NewHttpStores builds an HTTP backend with ordered read origins and per-origin
+// authentication. Only transport failures on GET/HEAD before any HTTP response
+// may fail over; writes use the first target. The returned backend is safe for
+// concurrent use. Configuration and the optional HTTP client are copied.
+func NewHttpStores(config HttpConfig) (*HttpStores, error) {
+	client, err := newHTTPOriginClient(config)
+	if err != nil {
+		return nil, err
+	}
+	return &HttpStores{client: client, base: client.targets[0].String()}, nil
 }
 
 func (s HttpStores) Use(id string) Store {
-	client := s.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
 	return HttpStore{
-		client: client,
-		base:   strings.TrimRight(s.Target, "/"),
+		client: s.client,
+		base:   s.base,
 		id:     namespaceSegment(id),
 	}
 }
 
 type HttpStore struct {
-	client *http.Client
+	client *httpOriginClient
 	base   string
 	id     string
 }

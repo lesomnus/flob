@@ -143,7 +143,7 @@ func TestHttpLastModified(t *testing.T) {
 	if got := response.Header.Get("Last-Modified"); got != added.UTC().Format(http.TimeFormat) {
 		t.Fatalf("GET Last-Modified = %q", got)
 	}
-	remote := HttpStores{Client: server.Client(), Target: server.URL}.Use("t")
+	remote := mustHttpStores(t, server.Client(), server.URL).Use("t")
 	stat, err := remote.Stat(t.Context(), m.Digest)
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +169,7 @@ func TestHttpLastModified(t *testing.T) {
 	}
 	unknownServer := httptest.NewServer(unknown)
 	defer unknownServer.Close()
-	info, err := HttpStores{Client: unknownServer.Client(), Target: unknownServer.URL}.Use("t").Stat(t.Context(), d)
+	info, err := mustHttpStores(t, unknownServer.Client(), unknownServer.URL).Use("t").Stat(t.Context(), d)
 	if err != nil {
 		t.Fatal(err)
 	}
