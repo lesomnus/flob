@@ -6,6 +6,7 @@ on:
     branches:
       - main
     paths: &paths
+      - .dockerignore
       - .github/workflows/ci.yaml
       - "**/*.go"
       - cmd/**

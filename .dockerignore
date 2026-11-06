@@ -1,5 +1,6 @@
 *
 !cmd/
+!auth/
 !internal/
 !*.go
 !go.mod
