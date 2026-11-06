@@ -76,6 +76,24 @@ entries with `kind`/`value`. Its value type is `xli/cfg.Secret`: literals,
 Literal credentials are redacted in `flob conf`; references are preserved.
 See [CLI configuration](cmd/flob/README.md#http-read-origins-and-authentication).
 
+## Server authorization
+
+`HttpHandler.Authorizer` is optional. With no authorizer, serving remains
+unauthenticated. The CLI's `server.auth` configures OIDC verification, exact
+verified-claim matches and namespace/action grants. Unsupported or misspelled
+server settings fail configuration instead of silently disabling authentication.
+Authorization runs before accessing storage or reading an upload body.
+
+Server provider `kind: oidc` verifies the trust and claims of an ID token; client
+`kind: bearer` sends that token in Authorization. The two settings compose, but
+the OIDC policy does not accept arbitrary static Bearer secrets or Basic auth.
+See the [paired server/client example](cmd/flob/README.md#oidc-authentication).
+
+Missing/invalid credentials return 401 with a Bearer challenge, valid identities
+without a matching grant return 403, and unavailable verification metadata returns
+503. These responses do not expose verifier diagnostics or credentials. Read-only
+and namespace restrictions still apply in addition to authorization grants.
+
 ## Metadata Headers
 
 Blob metadata is conveyed through standard HTTP headers:

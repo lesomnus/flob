@@ -6,6 +6,7 @@ on:
     branches:
       - main
     paths: &paths
+      - .dockerignore
       - .github/workflows/ci.yaml
       - "**/*.go"
       - cmd/**
@@ -35,10 +36,7 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: go test -short -trimpath -timeout 10m ./...
-
-      - name: HTTP race tests
-        run: go test -race -short -trimpath -timeout 10m -run '^TestHttp' ./...
+        run: go test -race -short -trimpath -timeout 10m ./...
 
       - name: Verify standalone CLI module
         working-directory: cmd
