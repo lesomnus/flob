@@ -1,4 +1,4 @@
-package httpremote
+package flob
 
 import (
 	"encoding/base64"
@@ -6,17 +6,17 @@ import (
 	"strings"
 )
 
-// Auth selects an HTTP authentication scheme. Value is read for each actual
+// HTTPAuth selects an HTTP authentication scheme. Value is read for each actual
 // request, including redirects; it must be safe for concurrent use. Bearer
 // expects a token, and basic expects the unencoded username:password pair.
 // Providers can resolve literals, environment references or rotating files
 // without coupling the HTTP client to a configuration package.
-type Auth struct {
+type HTTPAuth struct {
 	Kind  string
 	Value func() (string, error)
 }
 
-func (a Auth) header() (string, error) {
+func (a HTTPAuth) header() (string, error) {
 	value, err := a.Value()
 	if err != nil {
 		return "", err

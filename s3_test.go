@@ -1184,7 +1184,7 @@ func TestHttpStoreLazyPresignedS3Redirect(t *testing.T) {
 	}
 	server := httptest.NewServer(HttpHandler{Stores: stores, Redirect: true})
 	defer server.Close()
-	reader, info, err := (HttpStores{Client: server.Client(), Target: server.URL}).Use("t").Open(t.Context(), m.Digest)
+	reader, info, err := mustHttpStores(t, server.Client(), server.URL).Use("t").Open(t.Context(), m.Digest)
 	if err != nil {
 		t.Fatal(err)
 	}

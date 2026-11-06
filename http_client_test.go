@@ -1,4 +1,4 @@
-package httpremote
+package flob
 
 import (
 	"context"
@@ -11,7 +11,15 @@ import (
 	"testing"
 )
 
-func unavailable(t *testing.T) string {
+func getHTTPOrigin(c *httpOriginClient, target string) (*http.Response, error) {
+	r, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.Do(r)
+}
+
+func unavailableHTTPOrigin(t *testing.T) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -22,15 +30,15 @@ func unavailable(t *testing.T) string {
 	return addr
 }
 
-func TestConnectionFailureUsesNextOrigin(t *testing.T) {
+func TestHttpOriginConnectionFailureUsesNextOrigin(t *testing.T) {
 	var path, authorization, cookie string
 	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path, authorization, cookie = r.URL.EscapedPath(), r.Header.Get("Authorization"), r.Header.Get("Cookie")
 		io.WriteString(w, "blob bytes")
 	}))
 	defer second.Close()
-	first := unavailable(t) + "/primary"
-	c, err := NewClient(nil, Config{Targets: []string{first, second.URL + "/fallback"}})
+	first := unavailableHTTPOrigin(t) + "/primary"
+	c, err := newHTTPOriginClient(HttpConfig{Targets: []string{first, second.URL + "/fallback"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +56,7 @@ func TestConnectionFailureUsesNextOrigin(t *testing.T) {
 	}
 }
 
-func TestHTTPResponsesAreTerminal(t *testing.T) {
+func TestHttpOriginHTTPResponsesAreTerminal(t *testing.T) {
 	for _, status := range []int{200, 401, 403, 404, 429, 500, 503} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			calls := 0
@@ -56,8 +64,8 @@ func TestHTTPResponsesAreTerminal(t *testing.T) {
 			defer first.Close()
 			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(200) }))
 			defer second.Close()
-			c, _ := NewClient(nil, Config{Targets: []string{first.URL, second.URL}})
-			resp, err := c.Get(first.URL + "/_/sha256:abc")
+			c, _ := newHTTPOriginClient(HttpConfig{Targets: []string{first.URL, second.URL}})
+			resp, err := getHTTPOrigin(c, first.URL+"/_/sha256:abc")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -69,12 +77,12 @@ func TestHTTPResponsesAreTerminal(t *testing.T) {
 	}
 }
 
-func TestWritesPinnedReadsAndCancellationDoNotFallback(t *testing.T) {
+func TestHttpOriginWritesPinnedReadsAndCancellationDoNotFallback(t *testing.T) {
 	calls := 0
 	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(200) }))
 	defer second.Close()
-	first := unavailable(t)
-	c, _ := NewClient(nil, Config{Targets: []string{first, second.URL}})
+	first := unavailableHTTPOrigin(t)
+	c, _ := newHTTPOriginClient(HttpConfig{Targets: []string{first, second.URL}})
 	for _, method := range []string{"POST", "PATCH", "DELETE", "GET"} {
 		req, _ := http.NewRequest(method, first+"/_/sha256:abc", nil)
 		if method == "GET" {
@@ -95,7 +103,7 @@ func TestWritesPinnedReadsAndCancellationDoNotFallback(t *testing.T) {
 	}
 }
 
-func TestFallbackRelativeRedirectUsesFallbackOrigin(t *testing.T) {
+func TestHttpOriginFallbackRelativeRedirectUsesFallbackOrigin(t *testing.T) {
 	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/alias" {
 			http.Redirect(w, r, "/_/blob", 308)
@@ -104,9 +112,9 @@ func TestFallbackRelativeRedirectUsesFallbackOrigin(t *testing.T) {
 		io.WriteString(w, "ok")
 	}))
 	defer second.Close()
-	first := unavailable(t)
-	c, _ := NewClient(nil, Config{Targets: []string{first, second.URL}})
-	resp, err := c.Get(first + "/alias")
+	first := unavailableHTTPOrigin(t)
+	c, _ := newHTTPOriginClient(HttpConfig{Targets: []string{first, second.URL}})
+	resp, err := getHTTPOrigin(c, first+"/alias")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,9 +124,9 @@ func TestFallbackRelativeRedirectUsesFallbackOrigin(t *testing.T) {
 	}
 }
 
-func TestInvalidTargets(t *testing.T) {
+func TestHttpOriginInvalidTargets(t *testing.T) {
 	for _, targets := range [][]string{nil, {"ftp://example.com"}, {"https://user:secret@example.com"}, {"https://example.com?token=secret"}, {"https://example.com", "https://example.com/"}} {
-		if _, err := NewClient(nil, Config{Targets: targets}); err == nil {
+		if _, err := NewHttpStores(HttpConfig{Targets: targets}); err == nil {
 			t.Fatalf("accepted %v", targets)
 		}
 	}

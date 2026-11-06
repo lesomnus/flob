@@ -17,6 +17,65 @@ URL structure:
 
 A digest is a 64-character lowercase hex-encoded SHA-256 string.
 
+## Go client
+
+Create the HTTP backend with `flob.NewHttpStores`. It configures origin selection,
+authentication and the HTTP client internally; no separate client package or
+manual `HttpStores.Client` injection is needed.
+
+```go
+stores, err := flob.NewHttpStores(flob.HttpConfig{
+    Targets: []string{"https://primary.example/blobs", "https://backup.example/blobs"},
+    Auth: map[string]flob.HTTPAuth{
+        "https://primary.example": {
+            Kind: "bearer",
+            Value: func() (string, error) { return os.Getenv("BLOB_TOKEN"), nil },
+        },
+    },
+})
+if err != nil {
+    panic(err)
+}
+store := stores.Use("_")
+```
+
+GET and HEAD advance to the next base only on a transport failure before any
+HTTP response. HTTP statuses (including 401, 404 and 5xx), writes, cancellation,
+If-Match reads and redirect failures do not trigger failover. Response bodies
+stream normally; interrupted bodies are returned to the caller rather than
+joined to another origin's bytes. Subsequent range reopens stay at the first
+GET response URL, as described in [Streaming client reads](#streaming-client-reads).
+
+`HttpConfig.Auth` maps exact origins to `HTTPAuth{Kind, Value}`. An origin is
+scheme, hostname and effective port, without a path or query. Hostnames are
+case insensitive; omitted ports are 443 for HTTPS and 80 for HTTP. Supported
+kinds are `bearer` (a token without the prefix) and `basic` (the unencoded
+`username:password` pair). `Value` is called for each actual request, including
+redirects, and must be safe for concurrent use. It can resolve a rotating secret
+file without rebuilding the backend. Errors or invalid credentials fail the
+request without failover. Configured authentication overrides the request's
+Authorization header at that origin. Public origins omit their auth entry.
+
+Cross-origin transitions strip explicit Authorization, Proxy-Authorization,
+Cookie and custom Host values, including on a redirect back to an earlier
+origin. Authentication is then selected for the actual destination. CookieJar
+cookies retain standard domain/path/secure rules; cookies are not isolated by
+port. The supplied client's CheckRedirect hook runs after header stripping and
+may deliberately set new headers.
+
+An optional `HttpConfig.Client` supplies standard HTTP settings such as a
+CookieJar, redirect policy or TLS transport. The client is copied. Its Timeout
+bounds all attempts and reading the body. With no custom transport, dial, TLS
+and response-header waits are bounded. `WrapTransport` can add tracing after
+these defaults are configured. A custom transport keeps its own timeout policy.
+The targets and authentication map are copied; configure them before construction.
+
+The CLI exposes the same backend through `targets` and origin-keyed `auth`
+entries with `kind`/`value`. Its value type is `xli/cfg.Secret`: literals,
+`${env:NAME}` and `${file:/path}`, with references occupying the entire value.
+Literal credentials are redacted in `flob conf`; references are preserved.
+See [CLI configuration](cmd/flob/README.md#http-read-origins-and-authentication).
+
 ## Metadata Headers
 
 Blob metadata is conveyed through standard HTTP headers:

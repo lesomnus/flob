@@ -9,7 +9,6 @@ on:
       - .github/workflows/ci.yaml
       - "**/*.go"
       - cmd/**
-      - httpremote/**
       - docker-bake.hcl
       - Dockerfile
       - go.mod
@@ -38,13 +37,8 @@ jobs:
       - name: Test
         run: go test -short -trimpath -timeout 10m ./...
 
-      - name: Verify HTTP remote module
-        working-directory: httpremote
-        env:
-          GOWORK: "off"
-        run: |
-          go vet ./...
-          go test -race -trimpath -timeout 10m ./...
+      - name: HTTP race tests
+        run: go test -race -short -trimpath -timeout 10m -run '^TestHttp' ./...
 
       - name: Verify standalone CLI module
         working-directory: cmd
@@ -58,7 +52,7 @@ jobs:
       - name: Test CLI against the same library source
         run: |
           export GOWORK="$RUNNER_TEMP/flob.work"
-          go work init . ./cmd ./httpremote
+          go work init . ./cmd
           go vet ./cmd/...
           go test -short -trimpath -timeout 10m ./cmd/...
 

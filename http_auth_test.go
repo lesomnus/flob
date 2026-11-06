@@ -1,4 +1,4 @@
-package httpremote
+package flob
 
 import (
 	"errors"
@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func TestRedirectMustNotRestoreCredentials(t *testing.T) {
+func TestHttpOriginRedirectMustNotRestoreCredentials(t *testing.T) {
 	var auth, cookie, proxyAuth string
 	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/alias" {
@@ -25,8 +25,8 @@ func TestRedirectMustNotRestoreCredentials(t *testing.T) {
 		io.WriteString(w, "ok")
 	}))
 	defer second.Close()
-	first := unavailable(t)
-	c, err := NewClient(nil, Config{Targets: []string{first, second.URL}})
+	first := unavailableHTTPOrigin(t)
+	c, err := newHTTPOriginClient(HttpConfig{Targets: []string{first, second.URL}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,23 +44,23 @@ func TestRedirectMustNotRestoreCredentials(t *testing.T) {
 	}
 }
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
+type httpOriginRoundTripperFunc func(*http.Request) (*http.Response, error)
 
-func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func (f httpOriginRoundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func TestFallbackCookiesBelongToFallback(t *testing.T) {
+func TestHttpOriginFallbackCookiesBelongToFallback(t *testing.T) {
 	jar, _ := cookiejar.New(nil)
-	base := &http.Client{Jar: jar, Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+	base := &http.Client{Jar: jar, Transport: httpOriginRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Host == "primary.invalid" {
 			return nil, errors.New("connection failed")
 		}
 		return &http.Response{StatusCode: 200, Header: http.Header{"Set-Cookie": []string{"session=fallback-token; Path=/"}}, Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
 	})}
-	c, err := NewClient(base, Config{Targets: []string{"https://primary.invalid", "https://fallback.invalid"}})
+	c, err := newHTTPOriginClient(HttpConfig{Client: base, Targets: []string{"https://primary.invalid", "https://fallback.invalid"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := c.Get("https://primary.invalid/blob")
+	resp, err := getHTTPOrigin(c, "https://primary.invalid/blob")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,12 +72,12 @@ func TestFallbackCookiesBelongToFallback(t *testing.T) {
 	}
 }
 
-func TestOriginAuthenticationAcrossFailoverAndRedirect(t *testing.T) {
+func TestHttpOriginOriginAuthenticationAcrossFailoverAndRedirect(t *testing.T) {
 	const primary = "https://origin.invalid:8443"
 	const fallback = "https://origin.invalid:9443"
 	const public = "http://origin.invalid:9443"
 	var calls []string
-	base := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+	base := &http.Client{Transport: httpOriginRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		calls = append(calls, r.URL.String()+" "+r.Header.Get("Authorization"))
 		switch r.URL.String() {
 		case primary + "/blob":
@@ -91,12 +91,12 @@ func TestOriginAuthenticationAcrossFailoverAndRedirect(t *testing.T) {
 			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody, Request: r}, nil
 		}
 	})}
-	auth := map[string]Auth{primary: literalAuth("bearer", "primary-token"), fallback: literalAuth("basic", "backup-user:backup-pass")}
-	c, err := NewClient(base, Config{Targets: []string{primary, fallback}, Auth: auth})
+	auth := map[string]HTTPAuth{primary: httpAuthLiteral("bearer", "primary-token"), fallback: httpAuthLiteral("basic", "backup-user:backup-pass")}
+	c, err := newHTTPOriginClient(HttpConfig{Client: base, Targets: []string{primary, fallback}, Auth: auth})
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth[fallback] = literalAuth("bearer", "changed-after-construction")
+	auth[fallback] = httpAuthLiteral("bearer", "changed-after-construction")
 	r, _ := http.NewRequest("GET", primary+"/blob", nil)
 	r.Header.Set("Authorization", "Bearer caller-token")
 	r.Header.Set("Cookie", "caller=secret")
@@ -115,8 +115,8 @@ func TestOriginAuthenticationAcrossFailoverAndRedirect(t *testing.T) {
 	}
 }
 
-func TestRedirectReturnDoesNotRestoreOriginalCredentials(t *testing.T) {
-	base := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+func TestHttpOriginRedirectReturnDoesNotRestoreOriginalCredentials(t *testing.T) {
+	base := &http.Client{Transport: httpOriginRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		location := ""
 		switch r.URL.String() {
 		case "https://a.invalid/start":
@@ -133,7 +133,7 @@ func TestRedirectReturnDoesNotRestoreOriginalCredentials(t *testing.T) {
 		}
 		return &http.Response{StatusCode: status, Header: http.Header{"Location": {location}}, Body: http.NoBody, Request: r}, nil
 	})}
-	c, err := NewClient(base, Config{Targets: []string{"https://a.invalid"}})
+	c, err := newHTTPOriginClient(HttpConfig{Client: base, Targets: []string{"https://a.invalid"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,11 +147,11 @@ func TestRedirectReturnDoesNotRestoreOriginalCredentials(t *testing.T) {
 	resp.Body.Close()
 }
 
-func TestFallbackUsesItsCookieJar(t *testing.T) {
+func TestHttpOriginFallbackUsesItsCookieJar(t *testing.T) {
 	jar, _ := cookiejar.New(nil)
 	fallback, _ := url.Parse("https://fallback.invalid")
 	jar.SetCookies(fallback, []*http.Cookie{{Name: "session", Value: "fallback", Path: "/"}})
-	base := &http.Client{Jar: jar, Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+	base := &http.Client{Jar: jar, Transport: httpOriginRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Host == "primary.invalid" {
 			return nil, errors.New("connection failed")
 		}
@@ -160,22 +160,22 @@ func TestFallbackUsesItsCookieJar(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody, Request: r}, nil
 	})}
-	c, err := NewClient(base, Config{Targets: []string{"https://primary.invalid", fallback.String()}})
+	c, err := newHTTPOriginClient(HttpConfig{Client: base, Targets: []string{"https://primary.invalid", fallback.String()}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := c.Get("https://primary.invalid/blob")
+	resp, err := getHTTPOrigin(c, "https://primary.invalid/blob")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 }
 
-func TestRedirectFailuresDoNotRestartFailover(t *testing.T) {
+func TestHttpOriginRedirectFailuresDoNotRestartFailover(t *testing.T) {
 	for _, policyError := range []bool{false, true} {
 		t.Run(fmt.Sprint(policyError), func(t *testing.T) {
 			calls := 0
-			base := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			base := &http.Client{Transport: httpOriginRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 				calls++
 				if r.URL.Host == "fallback.invalid" {
 					t.Fatal("redirect failure retried at fallback")
@@ -188,11 +188,11 @@ func TestRedirectFailuresDoNotRestartFailover(t *testing.T) {
 			if policyError {
 				base.CheckRedirect = func(*http.Request, []*http.Request) error { return errors.New("policy denied") }
 			}
-			c, err := NewClient(base, Config{Targets: []string{"https://primary.invalid", "https://fallback.invalid"}})
+			c, err := newHTTPOriginClient(HttpConfig{Client: base, Targets: []string{"https://primary.invalid", "https://fallback.invalid"}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := c.Get("https://primary.invalid/blob"); err == nil {
+			if _, err := getHTTPOrigin(c, "https://primary.invalid/blob"); err == nil {
 				t.Fatal("expected redirect failure")
 			}
 			want := 2
@@ -206,9 +206,9 @@ func TestRedirectFailuresDoNotRestartFailover(t *testing.T) {
 	}
 }
 
-func TestTimeoutBoundsAllAttemptsAndBody(t *testing.T) {
+func TestHttpOriginTimeoutBoundsAllAttemptsAndBody(t *testing.T) {
 	var firstDeadline time.Time
-	base := &http.Client{Timeout: time.Second, Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+	base := &http.Client{Timeout: time.Second, Transport: httpOriginRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		deadline, ok := r.Context().Deadline()
 		if !ok {
 			t.Fatal("no request deadline")
@@ -222,11 +222,11 @@ func TestTimeoutBoundsAllAttemptsAndBody(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
 	})}
-	c, err := NewClient(base, Config{Targets: []string{"https://primary.invalid", "https://fallback.invalid"}})
+	c, err := newHTTPOriginClient(HttpConfig{Client: base, Targets: []string{"https://primary.invalid", "https://fallback.invalid"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := c.Get("https://primary.invalid/blob")
+	resp, err := getHTTPOrigin(c, "https://primary.invalid/blob")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,50 +242,50 @@ func TestTimeoutBoundsAllAttemptsAndBody(t *testing.T) {
 	}
 }
 
-func literalAuth(kind, value string) Auth {
-	return Auth{Kind: kind, Value: func() (string, error) { return value, nil }}
+func httpAuthLiteral(kind, value string) HTTPAuth {
+	return HTTPAuth{Kind: kind, Value: func() (string, error) { return value, nil }}
 }
 
-func TestInvalidAuthenticationConfiguration(t *testing.T) {
-	for _, auth := range []map[string]Auth{
-		{"https://origin.invalid/path": literalAuth("bearer", "secret")},
-		{"https://origin.invalid?query=secret": literalAuth("bearer", "secret")},
-		{"https://user:secret@origin.invalid": literalAuth("bearer", "secret")},
+func TestHttpOriginInvalidAuthenticationConfiguration(t *testing.T) {
+	for _, auth := range []map[string]HTTPAuth{
+		{"https://origin.invalid/path": httpAuthLiteral("bearer", "secret")},
+		{"https://origin.invalid?query=secret": httpAuthLiteral("bearer", "secret")},
+		{"https://user:secret@origin.invalid": httpAuthLiteral("bearer", "secret")},
 		{"https://origin.invalid": {Kind: "unsupported", Value: func() (string, error) { return "secret", nil }}},
 		{"https://origin.invalid": {Kind: "bearer"}},
-		{"https://origin.invalid": literalAuth("bearer", "one"), "https://ORIGIN.invalid:443/": literalAuth("bearer", "two")},
+		{"https://origin.invalid": httpAuthLiteral("bearer", "one"), "https://ORIGIN.invalid:443/": httpAuthLiteral("bearer", "two")},
 	} {
-		_, err := NewClient(nil, Config{Targets: []string{"https://origin.invalid"}, Auth: auth})
+		_, err := NewHttpStores(HttpConfig{Targets: []string{"https://origin.invalid"}, Auth: auth})
 		if err == nil || strings.Contains(err.Error(), "secret") {
 			t.Fatalf("invalid configuration error = %v", err)
 		}
 	}
 }
 
-func TestAuthenticationFailureIsTerminalAndRedacted(t *testing.T) {
-	for _, auth := range []Auth{
-		literalAuth("bearer", ""), literalAuth("bearer", "secret\ninvalid"),
-		literalAuth("basic", "secret-without-colon"), literalAuth("basic", "user:secret\ninvalid"),
+func TestHttpOriginAuthenticationFailureIsTerminalAndRedacted(t *testing.T) {
+	for _, auth := range []HTTPAuth{
+		httpAuthLiteral("bearer", ""), httpAuthLiteral("bearer", "secret\ninvalid"),
+		httpAuthLiteral("basic", "secret-without-colon"), httpAuthLiteral("basic", "user:secret\ninvalid"),
 		{Kind: "bearer", Value: func() (string, error) { return "", errors.New("credential source unavailable") }},
 	} {
-		base := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		base := &http.Client{Transport: httpOriginRoundTripperFunc(func(*http.Request) (*http.Response, error) {
 			t.Fatal("authentication failure reached transport or fallback")
 			return nil, nil
 		})}
-		c, err := NewClient(base, Config{Targets: []string{"https://origin.invalid", "https://fallback.invalid"}, Auth: map[string]Auth{"https://origin.invalid": auth}})
+		c, err := newHTTPOriginClient(HttpConfig{Client: base, Targets: []string{"https://origin.invalid", "https://fallback.invalid"}, Auth: map[string]HTTPAuth{"https://origin.invalid": auth}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = c.Get("https://origin.invalid/blob")
+		_, err = getHTTPOrigin(c, "https://origin.invalid/blob")
 		if err == nil || strings.Contains(err.Error(), "secret") {
 			t.Fatalf("authentication error = %v", err)
 		}
 	}
 }
 
-func TestTransportDecorationKeepsDefaultTimeouts(t *testing.T) {
+func TestHttpOriginTransportDecorationKeepsDefaultTimeouts(t *testing.T) {
 	calls := 0
-	_, err := NewClient(nil, Config{Targets: []string{"https://origin.invalid"}, WrapTransport: func(base http.RoundTripper) http.RoundTripper {
+	_, err := newHTTPOriginClient(HttpConfig{Targets: []string{"https://origin.invalid"}, WrapTransport: func(base http.RoundTripper) http.RoundTripper {
 		calls++
 		transport, ok := base.(*http.Transport)
 		if !ok || transport.ResponseHeaderTimeout <= 0 || transport.TLSHandshakeTimeout <= 0 {

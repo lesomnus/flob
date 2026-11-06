@@ -1,5 +1,4 @@
-// Package httpremote provides ordered HTTP origins for read-only downloads.
-package httpremote
+package flob
 
 import (
 	"context"
@@ -12,34 +11,39 @@ import (
 	"time"
 )
 
-// Client selects an origin before invoking http.Client.Do, so cookies and
-// redirects use the actual request URL. It is safe for concurrent use.
-type Client struct {
+// httpOriginClient selects an origin before invoking http.Client.Do, so cookies
+// and redirects use the actual request URL. It is safe for concurrent use.
+type httpOriginClient struct {
 	client  http.Client
 	targets []*url.URL
-	auth    map[string]Auth
+	auth    map[string]HTTPAuth
 }
 
-// Config separates ordered download bases from authentication. Auth maps exact
-// origins (scheme, hostname and effective port; no path) to credentials.
-// An origin without an entry receives no configured Authorization header.
-type Config struct {
+// HttpConfig configures an HTTP blob backend. Targets are ordered base URLs;
+// Auth maps exact origins (scheme, hostname and effective port; no path) to
+// credentials. An origin without an entry receives no configured Authorization.
+type HttpConfig struct {
+	// Client is copied; nil uses the default HTTP client. Its Timeout covers
+	// all failover attempts and reading the response body.
+	Client *http.Client
+	// Targets contains at least one HTTP(S) base URL. Reads may fail over in
+	// this order; writes start at the first target.
 	Targets []string
-	Auth    map[string]Auth
+	Auth    map[string]HTTPAuth
 	// WrapTransport decorates the selected transport once, after the default
 	// dial, TLS and response-header timeouts have been configured.
 	WrapTransport func(http.RoundTripper) http.RoundTripper
 }
 
-// NewClient copies client and configures ordered base URLs. Only GET/HEAD
-// transport failures before any HTTP response may advance to the next base.
+// newHTTPOriginClient selects an actual URL before http.Client.Do, so only
+// GET/HEAD transport failures before any response may advance to the next base.
 // Requests outside these bases, writes and If-Match reads do not fail over.
-// Configure the supplied HTTP client before calling NewClient.
-func NewClient(client *http.Client, config Config) (*Client, error) {
+// Configure the supplied HTTP client before calling NewHttpStores.
+func newHTTPOriginClient(config HttpConfig) (*httpOriginClient, error) {
 	if len(config.Targets) == 0 {
 		return nil, fmt.Errorf("at least one HTTP target is required")
 	}
-	c := &Client{client: *http.DefaultClient, auth: map[string]Auth{}}
+	c := &httpOriginClient{client: *http.DefaultClient, auth: map[string]HTTPAuth{}}
 	seen := map[string]bool{}
 	for i, raw := range config.Targets {
 		u, err := url.Parse(raw)
@@ -49,7 +53,7 @@ func NewClient(client *http.Client, config Config) (*Client, error) {
 		}
 		u.RawPath = strings.TrimRight(u.EscapedPath(), "/")
 		u.Path, _ = url.PathUnescape(u.RawPath)
-		key := origin(u) + u.EscapedPath()
+		key := httpOrigin(u) + u.EscapedPath()
 		if seen[key] {
 			return nil, fmt.Errorf("duplicate HTTP target at index %d", i)
 		}
@@ -62,7 +66,7 @@ func NewClient(client *http.Client, config Config) (*Client, error) {
 			u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 			return nil, fmt.Errorf("authentication requires an HTTP origin without a path, query or userinfo")
 		}
-		key := origin(u)
+		key := httpOrigin(u)
 		if _, exists := c.auth[key]; exists {
 			return nil, fmt.Errorf("duplicate authentication origin %s", key)
 		}
@@ -74,8 +78,8 @@ func NewClient(client *http.Client, config Config) (*Client, error) {
 		}
 		c.auth[key] = auth
 	}
-	if client != nil {
-		c.client = *client
+	if config.Client != nil {
+		c.client = *config.Client
 	}
 	if c.client.Transport == nil {
 		c.client.Transport = http.DefaultTransport
@@ -98,8 +102,8 @@ func NewClient(client *http.Client, config Config) (*Client, error) {
 		// net/http may restore initial credentials on another port or subdomain.
 		// Once a redirect crosses an origin, also strip them on any return hop.
 		for _, previous := range via {
-			if origin(previous.URL) != origin(req.URL) {
-				stripCredentials(req)
+			if httpOrigin(previous.URL) != httpOrigin(req.URL) {
+				stripHTTPCredentials(req)
 				break
 			}
 		}
@@ -117,7 +121,7 @@ func NewClient(client *http.Client, config Config) (*Client, error) {
 // Do streams a response without modifying r. The supplied client's Timeout
 // bounds all attempts and reading the response body. HTTP responses and
 // redirect errors are terminal; interrupted bodies are never retried.
-func (c *Client) Do(r *http.Request) (*http.Response, error) {
+func (c *httpOriginClient) Do(r *http.Request) (*http.Response, error) {
 	if r == nil || r.URL == nil {
 		return nil, fmt.Errorf("an HTTP request URL is required")
 	}
@@ -129,18 +133,18 @@ func (c *Client) Do(r *http.Request) (*http.Response, error) {
 	if err != nil || resp.Body == nil {
 		cancel()
 	} else {
-		resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
+		resp.Body = &httpCancelBody{ReadCloser: resp.Body, cancel: cancel}
 	}
 	return resp, err
 }
 
-func (c *Client) do(r *http.Request) (*http.Response, error) {
+func (c *httpOriginClient) do(r *http.Request) (*http.Response, error) {
 	start := -1
 	var suffix string
 	if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
 		(r.Body == nil || r.Body == http.NoBody) && r.Header.Get("If-Match") == "" {
 		for i, base := range c.targets {
-			if origin(r.URL) != origin(base) {
+			if httpOrigin(r.URL) != httpOrigin(base) {
 				continue
 			}
 			prefix, path := base.EscapedPath(), r.URL.EscapedPath()
@@ -163,12 +167,12 @@ func (c *Client) do(r *http.Request) (*http.Response, error) {
 			u.RawPath = target.EscapedPath() + suffix
 			u.Path, _ = url.PathUnescape(u.RawPath)
 			req.URL = &u
-			if origin(req.URL) != origin(r.URL) {
-				stripCredentials(req)
+			if httpOrigin(req.URL) != httpOrigin(r.URL) {
+				stripHTTPCredentials(req)
 			}
 		}
 		// A response followed by a redirect failure must not restart the download.
-		attempt := &attemptTransport{base: c.client.Transport, auth: c.auth}
+		attempt := &httpAttemptTransport{base: c.client.Transport, auth: c.auth}
 		h := c.client
 		h.Timeout = 0 // Do owns the deadline across all attempts and the body.
 		h.Transport = attempt
@@ -181,32 +185,14 @@ func (c *Client) do(r *http.Request) (*http.Response, error) {
 	return nil, last
 }
 
-// Get sends a GET request through Do.
-func (c *Client) Get(rawURL string) (*http.Response, error) {
-	r, err := http.NewRequest(http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	return c.Do(r)
-}
-
-// Head sends a HEAD request through Do.
-func (c *Client) Head(rawURL string) (*http.Response, error) {
-	r, err := http.NewRequest(http.MethodHead, rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	return c.Do(r)
-}
-
-func stripCredentials(r *http.Request) {
+func stripHTTPCredentials(r *http.Request) {
 	r.Host, r.URL.User = "", nil
-	removeHeader(r.Header, "Authorization")
-	removeHeader(r.Header, "Proxy-Authorization")
-	removeHeader(r.Header, "Cookie")
+	removeHTTPHeader(r.Header, "Authorization")
+	removeHTTPHeader(r.Header, "Proxy-Authorization")
+	removeHTTPHeader(r.Header, "Cookie")
 }
 
-func removeHeader(header http.Header, name string) {
+func removeHTTPHeader(header http.Header, name string) {
 	for key := range header {
 		if strings.EqualFold(key, name) {
 			delete(header, key)
@@ -214,7 +200,7 @@ func removeHeader(header http.Header, name string) {
 	}
 }
 
-func origin(u *url.URL) string {
+func httpOrigin(u *url.URL) string {
 	port := u.Port()
 	if port == "" {
 		if u.Scheme == "https" {
@@ -226,21 +212,21 @@ func origin(u *url.URL) string {
 	return strings.ToLower(u.Scheme) + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
-type attemptTransport struct {
+type httpAttemptTransport struct {
 	base      http.RoundTripper
-	auth      map[string]Auth
+	auth      map[string]HTTPAuth
 	responded bool
 	failed    bool
 }
 
-func (t *attemptTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if auth, ok := t.auth[origin(r.URL)]; ok {
+func (t *httpAttemptTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if auth, ok := t.auth[httpOrigin(r.URL)]; ok {
 		header, err := auth.header()
 		if err != nil {
-			return nil, fmt.Errorf("authentication for origin %s: %w", origin(r.URL), err)
+			return nil, fmt.Errorf("authentication for origin %s: %w", httpOrigin(r.URL), err)
 		}
 		r = r.Clone(r.Context())
-		removeHeader(r.Header, "Authorization")
+		removeHTTPHeader(r.Header, "Authorization")
 		r.Header.Set("Authorization", header)
 	}
 	resp, err := t.base.RoundTrip(r)
@@ -252,12 +238,12 @@ func (t *attemptTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-type cancelBody struct {
+type httpCancelBody struct {
 	io.ReadCloser
 	cancel context.CancelFunc
 }
 
-func (b *cancelBody) Read(p []byte) (int, error) {
+func (b *httpCancelBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil {
 		b.cancel()
@@ -265,7 +251,7 @@ func (b *cancelBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (b *cancelBody) Close() error {
+func (b *httpCancelBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.cancel()
 	return err
