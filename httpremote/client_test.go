@@ -30,7 +30,7 @@ func TestConnectionFailureUsesNextOrigin(t *testing.T) {
 	}))
 	defer second.Close()
 	first := unavailable(t) + "/primary"
-	c, err := NewClient(nil, []string{first, second.URL + "/fallback"})
+	c, err := NewClient(nil, Config{Targets: []string{first, second.URL + "/fallback"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestHTTPResponsesAreTerminal(t *testing.T) {
 			defer first.Close()
 			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(200) }))
 			defer second.Close()
-			c, _ := NewClient(nil, []string{first.URL, second.URL})
+			c, _ := NewClient(nil, Config{Targets: []string{first.URL, second.URL}})
 			resp, err := c.Get(first.URL + "/_/sha256:abc")
 			if err != nil {
 				t.Fatal(err)
@@ -74,7 +74,7 @@ func TestWritesPinnedReadsAndCancellationDoNotFallback(t *testing.T) {
 	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(200) }))
 	defer second.Close()
 	first := unavailable(t)
-	c, _ := NewClient(nil, []string{first, second.URL})
+	c, _ := NewClient(nil, Config{Targets: []string{first, second.URL}})
 	for _, method := range []string{"POST", "PATCH", "DELETE", "GET"} {
 		req, _ := http.NewRequest(method, first+"/_/sha256:abc", nil)
 		if method == "GET" {
@@ -105,7 +105,7 @@ func TestFallbackRelativeRedirectUsesFallbackOrigin(t *testing.T) {
 	}))
 	defer second.Close()
 	first := unavailable(t)
-	c, _ := NewClient(nil, []string{first, second.URL})
+	c, _ := NewClient(nil, Config{Targets: []string{first, second.URL}})
 	resp, err := c.Get(first + "/alias")
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +118,7 @@ func TestFallbackRelativeRedirectUsesFallbackOrigin(t *testing.T) {
 
 func TestInvalidTargets(t *testing.T) {
 	for _, targets := range [][]string{nil, {"ftp://example.com"}, {"https://user:secret@example.com"}, {"https://example.com?token=secret"}, {"https://example.com", "https://example.com/"}} {
-		if _, err := NewClient(nil, targets); err == nil {
+		if _, err := NewClient(nil, Config{Targets: targets}); err == nil {
 			t.Fatalf("accepted %v", targets)
 		}
 	}

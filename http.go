@@ -283,9 +283,15 @@ func parseLastModified(h http.Header) time.Time {
 	return added
 }
 
+// HTTPClient sends HTTP requests. Both http.Client and clients implementing
+// origin selection at the Do layer can be used by HttpStores.
+type HTTPClient interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
 // HttpStores is an HTTP client for [HttpHandler] server.
 type HttpStores struct {
-	Client *http.Client
+	Client HTTPClient
 	Target string // base URL of the server, e.g. "http://localhost:8080"
 }
 
@@ -302,7 +308,7 @@ func (s HttpStores) Use(id string) Store {
 }
 
 type HttpStore struct {
-	client *http.Client
+	client HTTPClient
 	base   string
 	id     string
 }

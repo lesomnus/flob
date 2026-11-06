@@ -9,6 +9,7 @@ on:
       - .github/workflows/ci.yaml
       - "**/*.go"
       - cmd/**
+      - httpremote/**
       - docker-bake.hcl
       - Dockerfile
       - go.mod
@@ -36,6 +37,14 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -short -trimpath -timeout 10m ./...
+
+      - name: Verify HTTP remote module
+        working-directory: httpremote
+        env:
+          GOWORK: "off"
+        run: |
+          go vet ./...
+          go test -race -trimpath -timeout 10m ./...
 
       - name: Verify standalone CLI module
         working-directory: cmd
