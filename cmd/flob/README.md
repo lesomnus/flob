@@ -74,7 +74,7 @@ or joined to bytes from another server.
 An internal publisher can require GitHub Actions job identities instead of a
 stored credential. Omit `server.auth` to keep unauthenticated serving. When it
 is present, every supported operation requires a Bearer ID token and a matching
-grant. Null/empty policies, unknown auth fields, and invalid grants are errors.
+grant. Null/empty policies, unknown server/auth fields, and invalid grants are errors.
 
 ```yaml
 stores:
@@ -110,7 +110,7 @@ any repository can request an ID token for a chosen audience. For reusable
 workflows, `job_workflow_ref` can additionally constrain the called workflow.
 These claims authenticate jobs, not individual runner machines.
 
-Permissions select decoded namespace IDs exactly; `"*"` selects every namespace.
+Permissions select nonempty decoded namespace IDs exactly; `"*"` selects every namespace.
 Actions are `read` (GET/HEAD), `add` (POST), `label` (PATCH), and `erase` (DELETE).
 The example permits upload and read of published `_` blobs, with no label changes
 or deletion. Publishing into `_` makes data visible to a separate public reader
@@ -151,6 +151,53 @@ steps:
 
 Refresh the ID token before later requests once it expires. This endpoint accepts
 OIDC Bearer tokens directly; it does not issue registry-style login tokens.
+
+### Use the configured flob client
+
+The two `kind` fields describe different roles. Server
+`auth.providers.github.kind: oidc` selects the verifier and its trusted
+issuer/audience. Client `auth[origin].kind: bearer` selects the HTTP
+Authorization scheme. This OIDC server accepts neither Basic credentials nor
+an arbitrary opaque Bearer secret. Supply the issued OIDC ID token, not a
+GitHub PAT, `GITHUB_TOKEN`, or `ACTIONS_ID_TOKEN_REQUEST_TOKEN`.
+
+Save the client configuration as `flob-client.yaml`:
+
+```yaml
+stores:
+  http/publisher:
+    targets: [https://blob.example.com]
+    auth:
+      "https://blob.example.com":
+        kind: bearer
+        value: "${env:FLOB_OIDC_TOKEN}"
+client:
+  use: http/publisher
+```
+
+The target and auth key include the scheme and optional port. The audience
+`blob.example.com` is a token identifier requested from GitHub and checked by
+the server; it is not inferred from the target URL. In the workflow above,
+replace the upload commands with:
+
+```bash
+export FLOB_OIDC_TOKEN="$token"
+flob --conf flob-client.yaml add _ asset.bin
+```
+
+`value` follows the same literal/env/file syntax as other HTTP client auth.
+For a process whose token is refreshed externally, use
+`value: "${file:/run/secrets/flob-oidc-token}"`; the client rechecks the file for
+each request. Environment references resolve when the configuration is read,
+so obtain a fresh token before starting a later CLI invocation. No client-side
+OIDC login or automatic token issuance is performed. See the
+[GitHub OIDC reference](https://docs.github.com/en/actions/reference/security/oidc)
+for supported claims and token-request permissions.
+
+Discovery and JWKS refreshes have a shared ten-second total timeout. Canceling
+one caller stops only that caller's wait, and fresh cached keys remain usable
+while an unknown-key refresh is running. Actual provider failures still respect
+the refresh cooldown and deny access once cached keys expire.
 
 ## Commands
 

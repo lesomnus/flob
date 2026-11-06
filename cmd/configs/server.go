@@ -36,6 +36,15 @@ func (c *ServerConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	if err := unmarshal(&fields); err != nil {
 		return err
 	}
+	// The auth key itself must be checked too: silently ignoring "authh"
+	// would otherwise turn a protected configuration into a public server.
+	for name := range fields {
+		switch name {
+		case "use", "addr", "redirect", "read_only", "allowed_stores", "auth":
+		default:
+			return fmt.Errorf("server: unknown field %q", name)
+		}
+	}
 	if node, present := fields["auth"]; present {
 		if node == nil || node.Type() == ast.NullType || parsed.Auth == nil {
 			return errors.New("server.auth cannot be null; omit it for unauthenticated serving")

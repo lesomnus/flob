@@ -28,6 +28,26 @@ server:
   # addr: 0.0.0.0:8080            # listen address; network is inferred (tcp), or set it
   #                               # explicitly, e.g. tcp4:0.0.0.0:8087 / unix:/run/flob.sock
   # redirect: false               # true: GET redirects to a presigned S3 URL (S3 store only)
+  # read_only: false
+  # allowed_stores: ["_"]
+  # # Omit auth for public serving. See README.md for matching client config.
+  # # Server kind selects OIDC verification; client kind selects Bearer sending.
+  # auth:
+  #   providers:
+  #     github:
+  #       kind: oidc
+  #       issuer: https://token.actions.githubusercontent.com
+  #       audience: blob.example.com
+  #   permissions:
+  #     publish: {stores: ["_"], actions: [read, add]}
+  #   matches:
+  #     release:
+  #       for: github
+  #       when:
+  #         repository_id: "123456789"
+  #         workflow_ref: acme/assets/.github/workflows/publish.yml@refs/heads/main
+  #         ref: refs/heads/main
+  #       grant: [publish]
 
 client:
   # use: http/local
